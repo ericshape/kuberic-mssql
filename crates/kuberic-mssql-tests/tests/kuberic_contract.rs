@@ -33,7 +33,7 @@ use kuberic_mssql::{
     SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
     StandaloneDatabaseSnapshot, classify_availability_group, classify_bootstrap_ownership,
     classify_owned_availability_group, classify_replica_join, classify_replica_seed,
-    source_database_creation_token,
+    source_database_creation_token, testing_current_pin_bootstrap_descriptors,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -65,6 +65,9 @@ const DATABASE_ID: &str = "55555555-5555-4555-8555-555555555555";
 const DATABASE_GUID: &str = "66666666-6666-4666-8666-666666666666";
 const FAMILY_GUID: &str = "77777777-7777-4777-8777-777777777777";
 const FORK_ID: &str = "88888888-8888-4888-8888-888888888888";
+
+#[path = "kuberic_contract/readiness.rs"]
+mod readiness;
 
 fn run_runtime_effect_test<F>(future: F)
 where
@@ -1037,6 +1040,56 @@ fn bootstrap_ownership_is_derived_from_callback_configuration() {
         classify_bootstrap_ownership(&kuberic_identity(9), &current),
         Err(BootstrapOwnershipError::LocalMemberMissing)
     );
+    assert_eq!(
+        testing_current_pin_bootstrap_descriptors(
+            &kuberic_identity(1),
+            &topology_expectation(),
+            "replica-1.example:5022",
+            &current,
+        )
+        .unwrap(),
+        (0..3)
+            .map(|index| ReplicaDescriptor {
+                identity: ReplicaIdentity::desired(
+                    (index + 1).to_string(),
+                    format!("generation-{}", index + 1),
+                )
+                .unwrap(),
+                server_name: ServerName::new(format!("sql-{index}")).unwrap(),
+                endpoint: Endpoint::new(format!("sql-{index}"), 5022).unwrap(),
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn current_pin_compatibility_rejects_malformed_bootstrap_inputs_before_mutation_in_order() {
+    let mut wrong_roles = bound_replica_set();
+    wrong_roles.configuration.members[1].role = ReplicaRole::IdleSecondary;
+    wrong_roles.configuration.configuration_id = wrong_roles.configuration.expected_id();
+    wrong_roles.replicas[1].role = ReplicaRole::IdleSecondary;
+    wrong_roles.replicas[1].replication_address = " invalid ".into();
+
+    let mut invalid_address = bound_replica_set();
+    invalid_address.replicas[1].replication_address = " invalid ".into();
+    invalid_address.replicas[2].process_session_id =
+        invalid_address.replicas[1].process_session_id.clone();
+
+    for (current, expected) in [
+        (wrong_roles, "one Primary and two ActiveSecondary"),
+        (invalid_address, "current replica address is invalid"),
+    ] {
+        let (replicator, mutation) = bootstrap_replicator_for(0, Vec::new(), Vec::new());
+        replicator.open().await.unwrap();
+        let message = application_error(
+            replicator
+                .update_current_replica_set_configuration(current)
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains(expected), "{message}");
+        assert!(mutation.effects.lock().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -4838,7 +4891,10 @@ async fn seed_store_deadline_after_commit_classifies_durability_before_returning
     let retained: SeedDispatchRecord =
         serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
             .unwrap();
-    assert_eq!(retained.phase(), SeedDispatchPhase::Intent);
+    assert_eq!(
+        retained,
+        exact_seed_record(1, "deadline-after-store-commit")
+    );
 
     replicator
         .build_replica(target_build(2, "successor-after-store-deadline"))
@@ -4926,6 +4982,21 @@ async fn target_host_evidence_gates_completion_and_rejects_stale_build_session_r
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     release_tx.send(()).unwrap();
     callback.await.unwrap().unwrap();
+    let request = exchange.previous_request.lock().unwrap().clone().unwrap();
+    assert_eq!(request.resource_uid(), "resource-a");
+    assert_eq!(
+        request.configuration_id(),
+        configuration().configuration_id.to_string()
+    );
+    assert_eq!(request.build_id(), "evidence-gated-build");
+    assert_eq!(request.target_identity(), &kuberic_identity(2));
+    assert_eq!(request.target_process_session_id().as_str(), "session-2");
+    assert_eq!(request.target_native_replica_id().as_str(), SECOND_ID);
+    assert!(
+        request
+            .challenge()
+            .starts_with("evidence-gated-build:session-2:")
+    );
     drop(replicator);
 
     let replacement_executor = Arc::new(SeedMutationExecutor {
@@ -5011,18 +5082,18 @@ async fn build_rejects_changed_session_before_dispatch_and_corrupt_seed_state_on
     let (replicator, executor, _) = seed_replicator(root.path().to_owned());
     admit_seed_replicator(&replicator).await;
 
-    let mut stale = target_build(1, "stale-session-build");
-    stale.process_session_id = ProcessSessionId::new("stale-session");
-    let message = application_error(replicator.build_replica(stale).await.unwrap_err());
-    assert!(message.contains("session"), "{message}");
-    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
-
     std::fs::write(root.path().join("seed-dispatch-v1.json"), b"{corrupt").unwrap();
     std::fs::set_permissions(
         root.path().join("seed-dispatch-v1.json"),
         std::fs::Permissions::from_mode(0o600),
     )
     .unwrap();
+    let mut stale = target_build(1, "stale-session-build");
+    stale.process_session_id = ProcessSessionId::new("stale-session");
+    let message = application_error(replicator.build_replica(stale).await.unwrap_err());
+    assert!(message.contains("session"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
     let message = application_error(
         replicator
             .build_replica(target_build(1, "corrupt-state-build"))
@@ -5066,7 +5137,7 @@ async fn winner_cancellation_before_durable_dispatch_allows_safe_rearbitration()
     let retained: SeedDispatchRecord =
         serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
             .unwrap();
-    assert_eq!(retained.phase(), SeedDispatchPhase::Intent);
+    assert_eq!(retained, exact_seed_record(1, "cancel-before-dispatch"));
     first.abort();
     release_tx.send(()).unwrap();
     assert!(matches!(
