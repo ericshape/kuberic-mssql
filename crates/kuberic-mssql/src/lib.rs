@@ -1,3 +1,4 @@
+mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod executor;
@@ -5,6 +6,7 @@ pub mod instance;
 #[cfg(feature = "kuberic")]
 pub mod kuberic;
 pub mod monitor;
+mod mutation;
 pub mod observation;
 pub mod observer;
 pub mod operation;
@@ -19,6 +21,15 @@ pub mod tds;
 pub mod topology_config;
 pub mod types;
 
+#[cfg(feature = "kuberic-testing")]
+pub use bootstrap::{
+    AvailabilityGroupOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
+    classify_owned_availability_group, classify_replica_join, classify_replica_seed,
+    classify_standalone_database, source_database_creation_token,
+};
+#[cfg(feature = "kuberic-testing")]
+pub use bootstrap::{BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership};
 pub use config::{
     AvailabilityMode, ClusterType, Edition, FailoverMode, MutationMode, SUPPORTED_DATABASE_COUNT,
     SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
@@ -29,6 +40,11 @@ pub use error::ContractError;
 #[cfg(feature = "kuberic")]
 pub use kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, SqlServerStartIncarnation,
+};
+#[cfg(feature = "kuberic-testing")]
+pub use mutation::{
+    BootstrapMutationPlan, MutationContractError, MutationEffect, STANDALONE_DATABASE_QUERY,
+    SeedDispatchEvidence, SeedDispatchRequest, SqlMutationExecutor,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,

@@ -12,12 +12,16 @@ use tokio::time::sleep;
 use kuberic_mssql::runtime_config::ObserverConfig;
 
 use super::availability_group::{
-    AvailabilityGroupError, FrozenMemberVerifier, ProvisionContext, ProvisionedAvailabilityGroup,
-    provision,
+    AvailabilityGroupError, FrozenMemberVerifier, PreparedAvailabilityGroup, ProvisionContext,
+    ProvisionedAvailabilityGroup, availability_group_name, database_name, finalize_prepared,
+    prepare, provision,
 };
-use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
+use super::data::{
+    DataContext, DataError, MarkerEvidence, prove_replicated_marker, verify_replicated_marker,
+};
 use crate::fixture::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
+    validated_identifier,
 };
 use crate::fixture::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
@@ -58,6 +62,9 @@ pub struct ReadyMember {
     pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
     pub observer_config: PathBuf,
+    pub admin_username: PathBuf,
+    pub admin_password: PathBuf,
+    pub ca_certificate: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +94,164 @@ impl LaunchedMembers {
         self.context.deadline
     }
 
+    pub async fn testing_set_primary_model_recovery_simple(&self) -> Result<(), AdminError> {
+        let mut session = self.testing_admin_session(0).await?;
+        session
+            .execute("ALTER DATABASE [model] SET RECOVERY SIMPLE;", &[])
+            .await
+    }
+
+    pub async fn testing_create_unowned_source_database(&self) -> Result<(), AdminError> {
+        let database = database_name(&self.run);
+        validated_identifier(&database)?;
+        self.testing_admin_session(0)
+            .await?
+            .execute(&format!("CREATE DATABASE [{database}];"), &[])
+            .await
+    }
+
+    pub async fn testing_create_unowned_availability_group(&self) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        validated_identifier(&group)?;
+        let clauses = self
+            .run
+            .members
+            .iter()
+            .map(|member| {
+                format!(
+                    "N'{server}' WITH (ENDPOINT_URL = N'TCP://{server}:5022', \
+                     AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, FAILOVER_MODE = EXTERNAL, \
+                     SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL))",
+                    server = member.server_name,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!(
+                    "CREATE AVAILABILITY GROUP [{group}] \
+                     WITH (CLUSTER_TYPE = EXTERNAL, \
+                     REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1) \
+                     FOR REPLICA ON {clauses};"
+                ),
+                &[],
+            )
+            .await
+    }
+
+    pub async fn testing_source_recovery_model(&self) -> Result<String, AdminError> {
+        let database = database_name(&self.run);
+        let mut session = self.testing_admin_session(0).await?;
+        let rows = session
+            .query_rows(
+                "SELECT CONVERT(nvarchar(60), recovery_model_desc) \
+                 FROM sys.databases WHERE name = @P1;",
+                &[&database],
+            )
+            .await?;
+        if rows.len() != 1 {
+            return Err(AdminError::MalformedResult);
+        }
+        rows[0]
+            .get::<&str, _>(0)
+            .map(str::to_owned)
+            .ok_or(AdminError::MalformedResult)
+    }
+
+    async fn testing_admin_session(&self, index: usize) -> Result<AdminSession, AdminError> {
+        let member = self.members.get(index).ok_or(AdminError::MalformedResult)?;
+        let endpoint = AdminEndpoint {
+            tcp_host: "127.0.0.1".to_owned(),
+            tls_hostname: "localhost".to_owned(),
+            port: member.host_port,
+            ca_certificate: member.ca_certificate.clone(),
+        };
+        let login = LoginFiles {
+            username: member.admin_username.clone(),
+            password: member.admin_password.clone(),
+        };
+        let deadlines = AdminDeadlines {
+            connect: self.context.config.deadlines().sql_connect,
+            query: self.context.config.deadlines().sql_batch,
+        };
+        AdminSession::connect_database(&endpoint, &login, deadlines, "master", false).await
+    }
+
+    pub async fn testing_remove_managed_database_association(&self) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        let database = database_name(&self.run);
+        validated_identifier(&group)?;
+        validated_identifier(&database)?;
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!("ALTER AVAILABILITY GROUP [{group}] REMOVE DATABASE [{database}];"),
+                &[],
+            )
+            .await
+    }
+
+    pub async fn testing_recreate_availability_group_without_database(
+        &self,
+    ) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        validated_identifier(&group)?;
+        for index in 1..3 {
+            self.testing_admin_session(index)
+                .await?
+                .execute(&format!("DROP AVAILABILITY GROUP [{group}];"), &[])
+                .await?;
+        }
+        self.testing_admin_session(0)
+            .await?
+            .execute(&format!("DROP AVAILABILITY GROUP [{group}];"), &[])
+            .await?;
+
+        let clauses = self
+            .run
+            .members
+            .iter()
+            .map(|member| {
+                format!(
+                    "N'{server}' WITH (ENDPOINT_URL = N'TCP://{server}:5022', \
+                     AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, FAILOVER_MODE = EXTERNAL, \
+                     SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL))",
+                    server = member.server_name,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!(
+                    "CREATE AVAILABILITY GROUP [{group}] \
+                     WITH (CLUSTER_TYPE = EXTERNAL, \
+                     REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1) \
+                     FOR REPLICA ON {clauses}; \
+                     ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"
+                ),
+                &[],
+            )
+            .await?;
+        for index in 1..3 {
+            self.testing_admin_session(index)
+                .await?
+                .execute(
+                    &format!(
+                        "ALTER AVAILABILITY GROUP [{group}] \
+                         JOIN WITH (CLUSTER_TYPE = EXTERNAL); \
+                         ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"
+                    ),
+                    &[],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
         self.context.cleanup_exact()
     }
@@ -103,6 +268,45 @@ impl LaunchedMembers {
             .store
             .block_for_current_process(&mut self.context.journal)
             .map_err(|_| NativeLaunchError::Journal)
+    }
+
+    pub fn restart_sql_process_for_test(&mut self, index: usize) -> Result<u16, NativeLaunchError> {
+        let member = self
+            .members
+            .get(index)
+            .ok_or(NativeLaunchError::Ownership)?;
+        let timeout = self
+            .context
+            .limit(self.context.config.deadlines().docker_command)?;
+        self.context
+            .docker
+            .stop_container(&member.container_id, timeout)
+            .map_err(NativeLaunchError::Docker)?;
+        let timeout = self
+            .context
+            .limit(self.context.config.deadlines().docker_command)?;
+        self.context
+            .docker
+            .start_container(&member.container_id, timeout)
+            .map_err(NativeLaunchError::Docker)?;
+        let inspection = self
+            .context
+            .docker
+            .inspect_container(
+                &member.container_id,
+                self.context
+                    .limit(self.context.config.deadlines().docker_command)?,
+            )
+            .map_err(NativeLaunchError::Docker)?
+            .ok_or(NativeLaunchError::Ownership)?;
+        let host_port = inspection
+            .ports
+            .iter()
+            .find(|port| port.container_port == 1433 && port.host_ip == "127.0.0.1")
+            .map(|port| port.host_port)
+            .ok_or(NativeLaunchError::Readiness)?;
+        self.members[index].host_port = host_port;
+        Ok(host_port)
     }
 
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
@@ -149,6 +353,78 @@ impl LaunchedMembers {
         Ok(provisioned)
     }
 
+    pub async fn prepare_availability_group(
+        &mut self,
+    ) -> Result<PreparedAvailabilityGroup, NativePhaseError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let tls = self
+            .context
+            .tls
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let frozen_member_verifier = LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        };
+        prepare(ProvisionContext {
+            run: &self.run,
+            members: &self.members,
+            credentials,
+            tls,
+            deadlines: self.context.config.deadlines(),
+            complete_deadline: self.context.deadline,
+            store: &self.context.store,
+            journal: &mut self.context.journal,
+            runner: &self.context.runner,
+            frozen_member_verifier: &frozen_member_verifier,
+        })
+        .await
+        .map_err(NativePhaseError::AvailabilityGroup)
+    }
+
+    pub async fn finalize_prepared_availability_group(
+        &mut self,
+        prepared: &PreparedAvailabilityGroup,
+    ) -> Result<ProvisionedAvailabilityGroup, NativePhaseError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let tls = self
+            .context
+            .tls
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let frozen_member_verifier = LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        };
+        finalize_prepared(
+            ProvisionContext {
+                run: &self.run,
+                members: &self.members,
+                credentials,
+                tls,
+                deadlines: self.context.config.deadlines(),
+                complete_deadline: self.context.deadline,
+                store: &self.context.store,
+                journal: &mut self.context.journal,
+                runner: &self.context.runner,
+                frozen_member_verifier: &frozen_member_verifier,
+            },
+            prepared,
+        )
+        .await
+        .map_err(NativePhaseError::AvailabilityGroup)
+    }
+
     pub async fn commit_replicated_marker(
         &self,
         evidence: &super::evidence::ValidatedNativeEvidence,
@@ -169,6 +445,30 @@ impl LaunchedMembers {
                 complete_deadline: self.context.deadline,
             },
             evidence,
+        )
+        .await
+    }
+
+    pub async fn verify_replicated_marker(
+        &self,
+        marker: &MarkerEvidence,
+    ) -> Result<MarkerEvidence, DataError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(DataError::WrongDatabase)?;
+        let tls = self.context.tls.as_ref().ok_or(DataError::WrongDatabase)?;
+        verify_replicated_marker(
+            &DataContext {
+                run: &self.run,
+                members: &self.members,
+                credentials,
+                tls,
+                deadlines: self.context.config.deadlines(),
+                complete_deadline: self.context.deadline,
+            },
+            marker,
         )
         .await
     }
@@ -480,6 +780,9 @@ pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<Path
         sql_start_time: "1970-01-01T00:00:00".to_owned(),
         sql_start_unix_millis: 1,
         observer_config: store_root_observer_path(root, index),
+        admin_username: root.join("credentials/admin-username"),
+        admin_password: root.join("credentials/admin-password"),
+        ca_certificate: root.join("tls/ca-certificate.pem"),
     });
     let mut launched = LaunchedMembers {
         context,
@@ -933,6 +1236,9 @@ impl LaunchContext {
                 sql_start_time: evidence.sql_start_time,
                 sql_start_unix_millis: evidence.sql_start_unix_millis,
                 observer_config,
+                admin_username: credentials.admin_username.path().to_path_buf(),
+                admin_password: credentials.admin_password.path().to_path_buf(),
+                ca_certificate: tls.ca_certificate.path().to_path_buf(),
             });
             incarnations.push(incarnation);
         }

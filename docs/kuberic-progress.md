@@ -7,11 +7,13 @@ through Kuberic's fixed Service Fabric-compatible `Replicator` contract. It does
 not change Kuberic's API and does not convert SQL Server database log positions
 into a generic scalar.
 
-The integration is deliberately observe-only. It can open as a Kuberic
-application, validate a requested native role, and report current progress. It
-cannot build or remove replicas, change availability-group configuration, wait
-for catch-up, handle data loss, seed a database, grant write access, renew a
-lease, switch over, or fail over.
+Ordinary construction is deliberately observe-only. It can open as a Kuberic
+application, validate a requested native role, and report current progress. An
+explicit bootstrap-capable construction used by licensed validation can also
+create the managed source database and AG, join local secondaries, and execute
+one build-authorized automatic-seeding dispatch. Neither construction can
+remove/reseed replicas, grant write access, renew a lease, switch over, fail
+over, or handle data loss.
 
 ## Two Progress Domains
 
@@ -97,10 +99,11 @@ and the callback's full identities, roles, process sessions and replication
 addresses.
 
 Kuberic can deliver the bootstrap callback before remote sessions are known.
-Empty remote descriptions may be completed in one direction; after completion,
-replay is value-identical. SQL Server process incarnation is local evidence:
-each runtime freezes and revalidates its own start identity, while the
-three-member validation proves all members collectively.
+Complete remote descriptions freeze the binding. Later callbacks may omit a
+remote session or address projection without clearing that binding, while every
+supplied value must still match exactly. SQL Server process incarnation is
+local evidence: each runtime freezes and revalidates its own start identity,
+while the three-member validation proves all members collectively.
 
 `catch_up_capability` is reported as a fresh configuration sequence equal to
 current progress after native topology admission. It does not depend on remote
@@ -114,10 +117,12 @@ The locked controller comparison treats a member at the current sequence or one
 behind as not requiring full repair, and a member two or more behind as
 requiring it. Contract tests preserve that exact boundary.
 
-Unbound adapters still reject both operations. Previous/current transitions,
-catch-up configuration and quorum, build, removal, data loss, recovery, lease,
-switchover, and failover callbacks remain explicit observe-only errors. No
-callback returns a dummy success or fabricated value.
+Unbound and ordinary adapters reject bootstrap mutation and build operations.
+Only explicitly bootstrap-capable adapters accept initial current-configuration
+effects and target builds. Previous/current transitions, catch-up configuration
+and quorum, removal, data loss, destructive recovery, lease, switchover, and
+failover callbacks remain explicit unsupported errors. No callback returns a
+dummy success or fabricated value.
 
 ## Ownership Model
 
@@ -139,9 +144,66 @@ by the reviewed operators:
   StatefulSet, Service, and ensure-exists provisioning patterns, but it is
   single-replica and provides no HA precedent.
 
-Kuberic's replica-local runtime, rather than the Kubernetes controller, should
-eventually own SQL bootstrap, join, seeding, lease, and role transitions under
-durable Kuberic authority.
+Kuberic's replica-local runtime now owns the bounded bootstrap/join/initial-seed
+slice under durable Kuberic authority. The configured primary owns source
+database and AG convergence, each secondary owns only its local join, and one
+authorized target build wins a group-level seed dispatch.
+
+Kuberic's command/effect/build receipts and exact SQL Server postconditions
+remain the primary durable evidence. The application persists only the
+pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
+`FailedRetryable` handshake under its existing application root; exact source
+association plus the exact terminal SQL marker removes that temporary record. A
+schema-v1 `Dispatched` record instead migrates to tokenless
+`LegacyAmbiguous`: exact native association may compact its group-database
+identity into a retained tombstone, while absent, incomplete, or conflicting
+association fails closed and cannot redispatch.
+
+The owned source database retains one matching singleton dispatch row with a
+derived operation token, exact AG/database identities, and SQL-owned phase. A
+group-scope SQL application lock distinguishes an active/ambiguous submission
+from a session that ended before any native effect. An accepted row or exact
+association evidence establishes one bounded terminal `master` extended
+property before file compaction. Its exact `v1:<operation-token>` value binds
+resource/configuration, AG GUID, source identity/lineage and SQL incarnation,
+and both authorized targets. Healthy replay is native-only; later association
+loss or database/AG recreation is terminal conflict/unsafe and cannot create a
+new intent or issue another `ADD DATABASE`. Proven pre-effect or definite SQL
+rejection remains retryable instead of degrading into a later deadline. The
+native bootstrap path also retains narrow database and AG creation
+handshakes. A deterministic scoped DDL trigger is persisted before each
+irreversible create; only the exact token-bearing typed statement can
+atomically write the generated creation receipt. The source database then
+retains resource/configuration ownership and the frozen AG GUID. Replay, join,
+and seed reject missing or mismatched markers, including an exact-profile
+foreign same-name resource or a later same-name AG with a new GUID. This
+follows PostgreSQL v2's separation of Kuberic authority, application-native
+evidence and database state without copying PostgreSQL recovery mechanics or
+creating a generic operation ledger.
+
+Primary-side remote synchronization and seeding rows now advance dispatch
+progress only. Target build completion requires a fresh, challenge-bound direct
+observation from the target host. The explicit licensed test-host exchange
+authorizes the exact resource/configuration/build, target Kuberic identity and
+current process session; the callback independently revalidates native replica,
+AG/group-database identity, family/recovery-fork lineage,
+synchronized/healthy/online/not-suspended state, and the fixture-frozen target
+SQL start. Old sessions, superseded builds, replayed reports and a restarted
+target SQL process cannot satisfy the callback. The exchange is confined to
+bootstrap testing construction and leaves the pinned Kuberic protocol and
+ordinary runtime unchanged.
+
+Source creation, full-recovery configuration, ownership, marker schema, full
+backup, log-chain establishment, backup verification, AG intent/create/GUID
+binding, each local join, each local seeding grant, and its narrow SQL-owned
+grant-completion marker are independently classified. Read-only `msdb` history
+and the marker joined to the current AG GUID prevent completed work from being
+repeated; a retry dispatches only the next missing safe step.
+
+No new TLS certificate provisioning, production mutation configuration or
+plaintext bypass was added. Licensed validation reuses fixture-owned endpoint
+security and administrative credentials. Destructive reseed remains deferred
+until verified target fencing exists.
 
 ## Live Validation Paths
 
@@ -171,10 +233,13 @@ revalidation is idempotent. Production and future launchers remain responsible
 for explicit acknowledgement; the strict file-backed constructor and negative
 tests remain available for that purpose.
 
-Fixture-only administration creates and proves:
+Fixture-only preparation creates and proves:
 
 - one certificate-authenticated, started HADR endpoint on every member;
-- peer certificate users/logins with exact endpoint `CONNECT`;
+- peer certificate users/logins with exact endpoint `CONNECT`.
+
+Explicit bootstrap-capable hosts then create and prove:
+
 - one three-replica `CLUSTER_TYPE = EXTERNAL` AG;
 - synchronous commit, EXTERNAL failover metadata, automatic seeding, and
   readable secondary connections for every replica;
@@ -194,10 +259,10 @@ restart, container replacement, AG/database recreation, role drift, stale
 sample, sequence mismatch, suspended database, or unhealthy synchronization
 invalidates the binding.
 
-The licensed path then creates three public `ReplicaHost` applications for one
-shared Kuberic resource, initializes them through public control RPCs and
-admits the exact current configuration. Reports are bracketed by fresh direct
-observations and must show:
+The licensed path creates three public `ReplicaHost` applications for one shared
+Kuberic resource before the database and AG exist, initializes them through
+public control RPCs, and admits the exact current configuration and build
+authority. Reports are bracketed by fresh direct observations and must show:
 
 - one shared resource and current configuration with no previous
   configuration;
@@ -215,15 +280,30 @@ replicated marker is written only by the fixture administrator against the
 directly observed native primary.
 
 The licensed same-root restart test stops all three public hosts while retaining
-the SQL Server availability group and durable roots. Replacement hosts receive
-fresh process sessions, commands targeting every superseded session are
-rejected, exact reports reconverge within the bounded publication deadline, and
-the replicated marker remains readable from every native member. SQL Server
-processes are not restarted.
+SQL Server and durable roots. It covers every retained seed handshake phase,
+fresh replacement sessions, stale-session rejection, restart-driven
+compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
+continuity. SQL Server processes are not restarted.
 
-The ignored live tests additionally prove handled-signal and SIGKILL recovery,
-post-AG, post-agent, report-stage and post-restart fault checkpoints, exact
-cleanup, and a successful restart retry.
+The ignored live tests additionally prove handled-signal and SIGKILL recovery.
+The fault recipe uses test-only callback seams after each independently
+classified database/backup/AG/join/grant statement has executed through normal
+TDS, then replaces the hosts and reobserves native state. Seed submission and
+callback-publication windows use explicit test-only probes/gates around real
+callbacks, including before request submission, after submission, after SQL
+acceptance with a lost reply, and after definite SQL rejection.
+
+The conflict recipe has three isolated SQL-native cases observed through the
+normal TDS path: convergence from a source database that inherits `SIMPLE`
+recovery, refusal of an unowned same-name database, and refusal of an unowned
+exact-profile same-name AG. Its remaining AG/replica/endpoint/database/lineage
+cases are decoded-observation injections consumed by production validators; its
+SQL-incarnation validator uses a real process restart plus a test gate.
+Separate terminal-seed cases perform real post-compaction association removal
+and AG recreation with zero redispatch. Target-local evidence cases use real
+target SQL process restarts and test-injected lineage mismatches at
+pre-association, in-flight-seeding and post-native/pre-reply windows. Every
+scenario performs exact cleanup.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin
@@ -268,6 +348,10 @@ Run the real three-member path with an optional fixture root:
 
 ```bash
 just test-live-three-replica [root]
+just test-live-three-replica-restart [root]
+just test-live-three-replica-faults [root]
+just test-live-three-replica-conflicts [root]
+just test-live-three-replica-target-evidence [root]
 ```
 
 Recover the default or a selected journaled root:
@@ -282,19 +366,21 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-The three-replica happy path runs after the one-replica observer/CLI validation
-in `just ci`. Signal, recovery, and fault recipes remain explicit. The shipped acknowledgement example still
-contains `accepted: false` as documentation for the production/file-backed
-contract, but tests do not require it.
+The three-replica happy path and same-root restart run after the one-replica
+observer/CLI validation in `just ci`. Signal, recovery, fault and conflict
+recipes remain explicit. The shipped acknowledgement example still contains
+`accepted: false` as documentation for the production/file-backed contract, but
+tests do not require it.
 
 ## Deferred Work
 
 This integration does not yet provide:
 
 - SQL Server process ownership or restart containment;
-- production managed-database creation;
+- a supported production launcher/transport for managed-database, AG, join or
+  initial-seed convergence;
 - production endpoint certificate provisioning or rotation;
-- production replica join, automatic seeding, rebuild, or reseed;
+- destructive reseed before verified target fencing;
 - database-progress build and catch-up proofs;
 - application read/write access fencing;
 - external write-lease renewal and expiry evidence;

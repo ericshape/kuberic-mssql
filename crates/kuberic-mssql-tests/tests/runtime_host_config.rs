@@ -2,10 +2,12 @@ use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 use kuberic_mssql::runtime_host::{
     PeerRoutes, PeerRoutesError, ResolverConfig, RuntimeBindingError, RuntimeBindingStore,
-    RuntimeHostArgs, RuntimeHostConfig, RuntimeHostConfigError,
+    RuntimeHostArgs, RuntimeHostConfig, RuntimeHostConfigError, SeedDispatchPhase,
+    SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget, SeedStateError,
 };
 use kuberic_runtime::host::ApplicationStorageState;
 
@@ -596,6 +598,319 @@ async fn runtime_binding_recovers_only_stale_private_initialization_files() {
     write_private(&active, "incomplete");
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
     assert!(active.exists());
+}
+
+fn seed_guid(value: u32) -> String {
+    format!("{value:08x}-0000-4000-8000-000000000001")
+}
+
+fn seed_record() -> SeedDispatchRecord {
+    SeedDispatchRecord::new(
+        "resource-a",
+        "configuration-1",
+        "app-ag",
+        seed_guid(10),
+        "application",
+        seed_guid(20),
+        seed_guid(21),
+        seed_guid(22),
+        SeedDispatchTarget::new(
+            "replica-1",
+            "pod-1",
+            "generation-1",
+            "session-1",
+            seed_guid(31),
+        )
+        .unwrap(),
+        [
+            SeedDispatchTarget::new(
+                "replica-2",
+                "pod-2",
+                "generation-2",
+                "session-2",
+                seed_guid(32),
+            )
+            .unwrap(),
+            SeedDispatchTarget::new(
+                "replica-3",
+                "pod-3",
+                "generation-3",
+                "session-3",
+                seed_guid(33),
+            )
+            .unwrap(),
+        ],
+        "replica-2",
+        "build-2",
+        "2026-10-08 23:00:00.000",
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+
+    let store = SeedDispatchStore::open(binding.root()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+    let record = seed_record();
+    let mut invalid_initial_value = serde_json::to_value(&record).unwrap();
+    invalid_initial_value["phase"] = serde_json::json!("accepted");
+    let invalid_initial: SeedDispatchRecord =
+        serde_json::from_value(invalid_initial_value).unwrap();
+    assert_eq!(
+        store.create(&invalid_initial),
+        Err(SeedStateError::Malformed)
+    );
+    assert_eq!(store.load().unwrap(), None);
+    store.create(&record).unwrap();
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    assert_eq!(store.load().unwrap(), Some(record.clone()));
+    assert_eq!(
+        SeedDispatchStore::open(binding.root()).err(),
+        Some(SeedStateError::AlreadyOwned)
+    );
+
+    let text = fs::read_to_string(store.path()).unwrap();
+    assert!(!text.contains("password"));
+    assert!(!text.contains("agent-token-value"));
+    assert_eq!(
+        fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let mut changed_value = serde_json::to_value(&record).unwrap();
+    changed_value["resource_uid"] = serde_json::json!("other-resource");
+    let changed: SeedDispatchRecord = serde_json::from_value(changed_value).unwrap();
+    assert_eq!(
+        store.replace(record.revision(), changed),
+        Err(SeedStateError::RevisionMismatch)
+    );
+
+    let mut submitting = record.clone();
+    submitting.mark_submitting().unwrap();
+    let submitting = store.replace(record.revision(), submitting).unwrap();
+    assert_eq!(submitting.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(submitting.revision(), 2);
+    assert_eq!(
+        store.replace(record.revision(), submitting.clone()),
+        Err(SeedStateError::RevisionMismatch)
+    );
+
+    let mut regressed_value = serde_json::to_value(&submitting).unwrap();
+    regressed_value["phase"] = serde_json::json!("intent");
+    let regressed: SeedDispatchRecord = serde_json::from_value(regressed_value).unwrap();
+    assert_eq!(
+        store.replace(submitting.revision(), regressed),
+        Err(SeedStateError::InvalidTransition)
+    );
+
+    let mut accepted = submitting.clone();
+    accepted.mark_accepted().unwrap();
+    let accepted = store.replace(submitting.revision(), accepted).unwrap();
+    assert_eq!(accepted.phase(), SeedDispatchPhase::Accepted);
+
+    let mut associated = accepted.clone();
+    associated.associate_group_database(seed_guid(23)).unwrap();
+    let associated = store.replace(accepted.revision(), associated).unwrap();
+    assert_eq!(associated.group_database_id(), Some(seed_guid(23).as_str()));
+
+    let mut cleared_value = serde_json::to_value(&associated).unwrap();
+    cleared_value["group_database_id"] = serde_json::Value::Null;
+    let cleared: SeedDispatchRecord = serde_json::from_value(cleared_value).unwrap();
+    assert_eq!(
+        store.replace(associated.revision(), cleared),
+        Err(SeedStateError::InvalidTransition)
+    );
+    let mut replaced_value = serde_json::to_value(&associated).unwrap();
+    replaced_value["group_database_id"] = serde_json::json!(seed_guid(24));
+    let replaced: SeedDispatchRecord = serde_json::from_value(replaced_value).unwrap();
+    assert_eq!(
+        store.replace(associated.revision(), replaced),
+        Err(SeedStateError::InvalidTransition)
+    );
+
+    store.remove(associated.revision()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+}
+
+#[tokio::test]
+async fn seed_dispatch_store_serializes_concurrent_record_creation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let store = Arc::new(SeedDispatchStore::open(binding.root()).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.create(&seed_record())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(SeedStateError::AlreadyExists))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn intent_and_definite_failure_can_be_released_but_submitting_cannot() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let store = SeedDispatchStore::open(binding.root()).unwrap();
+
+    let record = seed_record();
+    store.create(&record).unwrap();
+    store.remove_intent(record.revision()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+
+    store.create(&record).unwrap();
+    let mut submitting = record.clone();
+    submitting.mark_submitting().unwrap();
+    let submitting = store.replace(record.revision(), submitting).unwrap();
+    assert_eq!(
+        store.remove_intent(submitting.revision()),
+        Err(SeedStateError::InvalidTransition)
+    );
+    let mut failed = submitting.clone();
+    failed.mark_failed_retryable().unwrap();
+    let failed = store.replace(submitting.revision(), failed).unwrap();
+    assert_eq!(failed.phase(), SeedDispatchPhase::FailedRetryable);
+    store.remove_intent(failed.revision()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+}
+
+#[tokio::test]
+async fn legacy_dispatched_seed_state_migrates_to_non_redispatchable_ambiguity_without_a_token() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let path = binding.root().join("seed-dispatch-v1.json");
+    let mut legacy = serde_json::to_value(seed_record()).unwrap();
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy["revision"] = serde_json::json!(2);
+    legacy["phase"] = serde_json::json!("dispatched");
+    legacy.as_object_mut().unwrap().remove("operation_token");
+    write_private(&path, serde_json::to_string_pretty(&legacy).unwrap());
+
+    let store = SeedDispatchStore::open(binding.root()).unwrap();
+    let migrated = store.load().unwrap().unwrap();
+    assert_eq!(migrated.phase(), SeedDispatchPhase::LegacyAmbiguous);
+    assert_eq!(migrated.revision(), 2);
+    assert_eq!(migrated.operation_token(), "");
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(persisted["schema_version"], serde_json::json!(2));
+    assert_eq!(persisted["phase"], serde_json::json!("legacy_ambiguous"));
+    assert!(persisted.get("operation_token").is_none());
+}
+
+#[tokio::test]
+async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+
+    {
+        let store = SeedDispatchStore::open(binding.root()).unwrap();
+        store.create(&seed_record()).unwrap();
+    }
+
+    let original = fs::read(binding.root().join("seed-dispatch-v1.json")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    value["secret"] = serde_json::json!("do-not-echo");
+    fs::write(
+        binding.root().join("seed-dispatch-v1.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(binding.storage_state(), Err(RuntimeBindingError::Malformed));
+
+    fs::write(binding.root().join("seed-dispatch-v1.json"), original).unwrap();
+    let active = binding
+        .root()
+        .join(format!(".seed-dispatch-v1.json.{}.new", std::process::id()));
+    write_private(&active, "incomplete");
+    assert_eq!(
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
+    );
+    fs::remove_file(active).unwrap();
+
+    let stale = binding.root().join(".seed-dispatch-v1.json.2147483647.new");
+    write_private(&stale, "incomplete");
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    assert!(!stale.exists());
+
+    fs::write(binding.root().join("foreign"), "foreign").unwrap();
+    assert_eq!(
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
+    );
+}
+
+#[tokio::test]
+async fn seed_dispatch_layout_rejects_symlinks_and_oversized_state() {
+    for entry in ["seed-dispatch-v1.json", "seed-dispatch-v1.owner"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime_config = config(temporary.path()).await;
+        let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+        binding.initialize().unwrap();
+        let target = temporary.path().join("target");
+        write_private(&target, "{}");
+        symlink(&target, binding.root().join(entry)).unwrap();
+        assert_eq!(
+            binding.storage_state(),
+            Err(RuntimeBindingError::UnsafeState),
+            "{entry}"
+        );
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    write_private(
+        &binding.root().join("seed-dispatch-v1.json"),
+        vec![b'x'; 65_537],
+    );
+    assert_eq!(
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
+    );
 }
 
 #[test]

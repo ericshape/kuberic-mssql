@@ -1,25 +1,39 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
-    ObservationClock, SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory,
-    SqlServerService, SqlServerServiceConfig,
+    KubericAdapterError, ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource,
+    SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
+    SqlServerStartIncarnation, TargetHostEvidenceExchange, TargetHostEvidenceReport,
+    TargetHostEvidenceRequest, TestingSeedStoreOperation, TestingSeedStoreStage,
 };
 use kuberic_mssql::observation::{
-    AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
-    InstanceSnapshot, LocalDatabaseSnapshot, LocalRecoveryMetadata, LocalReplicaSnapshot,
-    NativeProvenance, RecoveryLineageObservation, ReplicaSnapshot, ReplicaState,
+    AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
+    InstanceMetadata, InstanceSnapshot, LocalDatabaseSnapshot, LocalRecoveryMetadata,
+    LocalReplicaSnapshot, NativeProvenance, RecoveryLineageObservation, ReplicaSnapshot,
+    ReplicaState,
 };
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::runtime_host::{
+    SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget,
+};
 use kuberic_mssql::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
-    DatabaseLineage, DecimalProgress, Guid, NativeProgress, NativeRole, Observation,
-    ObservationFailure, ObservationFailureKind, ReplicaIdentity, ServerName, SqlIdentifier,
-    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation,
+    AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityGroupOwnership,
+    BootstrapOwnership, BootstrapOwnershipError, ConfigurationSequence, DatabaseIdentity,
+    DatabaseLineage, DecimalProgress, Endpoint, Guid, MutationEffect, NativeConvergenceState,
+    NativeProgress, NativeRole, Observation, ObservationFailure, ObservationFailureKind,
+    ReplicaDescriptor, ReplicaIdentity, SeedDispatchEvidence, SeedDispatchRequest, ServerName,
+    SqlIdentifier, SqlMutationExecutor, SqlServerTopologyExpectation,
+    SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
+    StandaloneDatabaseSnapshot, classify_availability_group, classify_bootstrap_ownership,
+    classify_owned_availability_group, classify_replica_join, classify_replica_seed,
+    source_database_creation_token,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -71,6 +85,12 @@ where
         .unwrap();
 }
 
+fn private_seed_root() -> std::path::PathBuf {
+    let root = tempfile::tempdir().unwrap().keep();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
 struct ScriptedSource {
     config: ObserverConfig,
     samples: Mutex<VecDeque<Result<Observation<InstanceSnapshot>, RuntimeError>>>,
@@ -94,6 +114,634 @@ impl SqlServerObservationSource for ScriptedSource {
 struct CountingSource {
     inner: ScriptedSource,
     observations: AtomicUsize,
+}
+
+struct ScriptedMutationExecutor {
+    databases: Mutex<VecDeque<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>>,
+    effects: Mutex<Vec<&'static str>>,
+    executions: Mutex<VecDeque<Result<(), RuntimeError>>>,
+}
+
+struct SeedMutationExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct GatedSeedMutationExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct SubmittedThenFailedSeedExecutor {
+    executions: AtomicUsize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct AcceptedReplyLostSeedExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct RejectOnceSeedExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct TerminalSeedMutationExecutor {
+    associated: Arc<AtomicBool>,
+    terminal: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct TerminalSeedSource {
+    config: ObserverConfig,
+    associated: Arc<AtomicBool>,
+    replaced_group: Arc<AtomicBool>,
+}
+
+struct SeedTargetEvidenceExchange {
+    complete: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlledTargetEvidenceMode {
+    Healthy,
+    ReplayPreviousAuthority,
+    Stale,
+    SqlRestarted,
+    LineageMismatch,
+}
+
+struct ControlledTargetEvidenceExchange {
+    modes: Mutex<VecDeque<ControlledTargetEvidenceMode>>,
+    previous_request: Mutex<Option<TargetHostEvidenceRequest>>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl ControlledTargetEvidenceExchange {
+    fn new(modes: impl IntoIterator<Item = ControlledTargetEvidenceMode>) -> Self {
+        Self {
+            modes: Mutex::new(modes.into_iter().collect()),
+            previous_request: Mutex::new(None),
+            entered: Mutex::new(None),
+            release: Mutex::new(None),
+        }
+    }
+
+    fn with_gate(
+        modes: impl IntoIterator<Item = ControlledTargetEvidenceMode>,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            modes: Mutex::new(modes.into_iter().collect()),
+            previous_request: Mutex::new(None),
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(Some(release)),
+        }
+    }
+}
+
+#[async_trait]
+impl TargetHostEvidenceExchange for ControlledTargetEvidenceExchange {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        let entered = self.entered.lock().unwrap().take();
+        let release = self.release.lock().unwrap().take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(release) = release {
+            release.await.map_err(|_| KubericAdapterError::Closed)?;
+        }
+        let mode = self
+            .modes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ControlledTargetEvidenceMode::Healthy);
+        let report_request =
+            if matches!(mode, ControlledTargetEvidenceMode::ReplayPreviousAuthority) {
+                self.previous_request.lock().unwrap().clone().ok_or(
+                    KubericAdapterError::NativeConvergenceUnsafe(
+                        "server-free prior target evidence",
+                    ),
+                )?
+            } else {
+                let current = request.clone();
+                *self.previous_request.lock().unwrap() = Some(current.clone());
+                current
+            };
+        let target_index = match request.target_identity().replica_id.value() {
+            2 => 1,
+            3 => 2,
+            _ => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "server-free target evidence identity",
+                ));
+            }
+        };
+        let mut snapshot = bound_snapshot_for(target_index);
+        let observed_at = if matches!(mode, ControlledTargetEvidenceMode::Stale) {
+            request.requested_at_unix_millis().saturating_sub(1)
+        } else {
+            request.requested_at_unix_millis()
+        };
+        snapshot.observed_at_unix_millis = observed_at;
+        if let Observation::Present {
+            value: group,
+            observed_at_unix_millis,
+        } = &mut snapshot.availability_group
+        {
+            *observed_at_unix_millis = observed_at;
+            if matches!(mode, ControlledTargetEvidenceMode::LineageMismatch) {
+                let alternate = guid("99999999-9999-4999-8999-999999999999");
+                let database = group.databases.first_mut().unwrap();
+                database
+                    .local
+                    .as_mut()
+                    .unwrap()
+                    .recovery
+                    .as_mut()
+                    .unwrap()
+                    .recovery_fork_guid = Some(alternate.clone());
+                let local_native = group
+                    .local_replica
+                    .identity
+                    .native_replica_id()
+                    .unwrap()
+                    .clone();
+                let local = database
+                    .replicas
+                    .iter_mut()
+                    .find(|state| state.replica_id == local_native)
+                    .unwrap();
+                if let RecoveryLineageObservation::Local { value } = &mut local.lineage {
+                    value.recovery_fork_id = alternate;
+                }
+            }
+        }
+        let frozen =
+            SqlServerStartIncarnation::new(snapshot.instance.sqlserver_start_time.clone()).unwrap();
+        if matches!(mode, ControlledTargetEvidenceMode::SqlRestarted) {
+            snapshot.instance.sqlserver_start_time = "2099-01-01T00:00:00".into();
+        }
+        Ok(TargetHostEvidenceReport::new(
+            report_request,
+            frozen,
+            snapshot,
+        ))
+    }
+}
+
+#[async_trait]
+impl TargetHostEvidenceExchange for SeedTargetEvidenceExchange {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        if !self.complete.load(Ordering::SeqCst) {
+            return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                "server-free target evidence requested before native completion",
+            ));
+        }
+        let target_index = match request.target_identity().replica_id.value() {
+            2 => 1,
+            3 => 2,
+            _ => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "server-free target evidence identity",
+                ));
+            }
+        };
+        let mut snapshot = bound_snapshot_for(target_index);
+        snapshot.observed_at_unix_millis = request.requested_at_unix_millis();
+        if let Observation::Present {
+            observed_at_unix_millis,
+            ..
+        } = &mut snapshot.availability_group
+        {
+            *observed_at_unix_millis = request.requested_at_unix_millis();
+        }
+        let frozen =
+            SqlServerStartIncarnation::new(snapshot.instance.sqlserver_start_time.clone()).unwrap();
+        Ok(TargetHostEvidenceReport::new(
+            request.clone(),
+            frozen,
+            snapshot,
+        ))
+    }
+}
+
+fn seed_terminal_evidence(complete: &AtomicBool) -> SeedDispatchEvidence {
+    if complete.load(Ordering::SeqCst) {
+        SeedDispatchEvidence::Terminal
+    } else {
+        SeedDispatchEvidence::Absent
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for TerminalSeedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(if self.terminal.load(Ordering::SeqCst) {
+            SeedDispatchEvidence::Terminal
+        } else {
+            SeedDispatchEvidence::Absent
+        })
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.terminal.store(true, Ordering::SeqCst);
+        self.associated.store(true, Ordering::SeqCst);
+        Ok(SeedDispatchEvidence::Terminal)
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("terminal seed executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlServerObservationSource for TerminalSeedSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        let mut snapshot = if self.associated.load(Ordering::SeqCst) {
+            seeded_source_snapshot()
+        } else {
+            bootstrap_membership_snapshot(0)
+        };
+        if self.replaced_group.load(Ordering::SeqCst)
+            && let Observation::Present { value: group, .. } = &mut snapshot.availability_group
+        {
+            group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+        }
+        Ok(present(snapshot))
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for GatedSeedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        assert_eq!(effect.label(), "add database to availability group");
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .expect("seed dispatch gate must be entered once")
+            .send(())
+            .expect("seed dispatch test must await the gate");
+        let release = self
+            .release
+            .lock()
+            .unwrap()
+            .take()
+            .expect("seed dispatch gate must be released once");
+        release
+            .await
+            .expect("seed dispatch test must release the gate");
+        self.complete.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for SubmittedThenFailedSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        let release = self.release.lock().unwrap().take().unwrap();
+        let _ = release.await;
+        Err(RuntimeError::new(
+            ObservationFailureKind::Unreachable,
+            "seed ADD DATABASE submission",
+            "SQL Server transport failed",
+        ))
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for AcceptedReplyLostSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.complete.store(true, Ordering::SeqCst);
+        Err(RuntimeError::new(
+            ObservationFailureKind::Unreachable,
+            "seed ADD DATABASE submission",
+            "SQL Server transport failed",
+        ))
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for RejectOnceSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        let attempt = self.executions.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            let mut error = RuntimeError::new(
+                ObservationFailureKind::Unsupported,
+                "seed ADD DATABASE submission",
+                "SQL Server rejected the observation query",
+            );
+            error.server_code = Some(51001);
+            Err(error)
+        } else {
+            self.complete.store(true, Ordering::SeqCst);
+            Ok(SeedDispatchEvidence::Terminal)
+        }
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for SeedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        assert_eq!(effect.label(), "add database to availability group");
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.complete.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
+    }
+}
+
+struct SeedSource {
+    config: ObserverConfig,
+    complete: Arc<AtomicBool>,
+}
+
+struct ControlledSeedSource {
+    config: ObserverConfig,
+    associated: Arc<AtomicBool>,
+    associated_snapshot: InstanceSnapshot,
+}
+
+#[async_trait]
+impl SqlServerObservationSource for SeedSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        let snapshot = if self.complete.load(Ordering::SeqCst) {
+            seeded_source_snapshot()
+        } else {
+            bootstrap_membership_snapshot(0)
+        };
+        Ok(present(snapshot))
+    }
+}
+
+#[async_trait]
+impl SqlServerObservationSource for ControlledSeedSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        Ok(present(if self.associated.load(Ordering::SeqCst) {
+            self.associated_snapshot.clone()
+        } else {
+            bootstrap_membership_snapshot(0)
+        }))
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for ScriptedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        self.databases
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test must provide one standalone database sample")
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        self.effects.lock().unwrap().push(effect.label());
+        self.executions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(SeedDispatchEvidence::Terminal)
+    }
+}
+
+struct GatedMutationExecutor {
+    databases: Mutex<VecDeque<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>>,
+    effects: Mutex<Vec<&'static str>>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl SqlMutationExecutor for GatedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        self.databases
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test must provide one standalone database sample")
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        self.effects.lock().unwrap().push(effect.label());
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutation gate must be entered once")
+            .send(())
+            .expect("test must wait for mutation gate");
+        let release = self
+            .release
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutation gate must be released once");
+        release.await.expect("test must release mutation gate");
+        Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
 }
 
 #[async_trait]
@@ -175,6 +823,18 @@ fn observer_config() -> ObserverConfig {
 }
 
 fn observer_config_for(index: usize) -> ObserverConfig {
+    observer_config_for_timeout(index, 1000)
+}
+
+fn observer_config_for_timeout(index: usize, sample_timeout_ms: u64) -> ObserverConfig {
+    observer_config_for_timing(index, sample_timeout_ms, 1)
+}
+
+fn observer_config_for_timing(
+    index: usize,
+    sample_timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> ObserverConfig {
     ObserverConfig::from_json(
         format!(
             r#"{{
@@ -186,10 +846,10 @@ fn observer_config_for(index: usize) -> ObserverConfig {
                 "incarnation":"pod-{index}",
                 "observer_username_file":"/secrets/username",
                 "observer_password_file":"/secrets/password",
-                "sample_timeout_ms":1000,
-                "connect_timeout_ms":1000,
-                "query_timeout_ms":1000,
-                "poll_interval_ms":1000,
+                "sample_timeout_ms":{sample_timeout_ms},
+                "connect_timeout_ms":{sample_timeout_ms},
+                "query_timeout_ms":{sample_timeout_ms},
+                "poll_interval_ms":{poll_interval_ms},
                 "max_age_ms":{MAX_AGE}
             }}"#
         )
@@ -351,6 +1011,393 @@ fn topology_expectation_for(local_index: usize) -> SqlServerTopologyExpectation 
     .unwrap()
 }
 
+fn desired_descriptors() -> Vec<ReplicaDescriptor> {
+    (0..3)
+        .map(|index| ReplicaDescriptor {
+            identity: ReplicaIdentity::desired(format!("logical-{index}"), format!("pod-{index}"))
+                .unwrap(),
+            server_name: ServerName::new(format!("sql-{index}")).unwrap(),
+            endpoint: Endpoint::new(format!("sql-{index}"), 5022).unwrap(),
+        })
+        .collect()
+}
+
+#[test]
+fn bootstrap_ownership_is_derived_from_callback_configuration() {
+    let current = bound_replica_set();
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(1), &current),
+        Ok(BootstrapOwnership::PrimaryTopology)
+    );
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(2), &current),
+        Ok(BootstrapOwnership::LocalJoin)
+    );
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(9), &current),
+        Err(BootstrapOwnershipError::LocalMemberMissing)
+    );
+}
+
+#[test]
+fn native_bootstrap_classifiers_cover_every_operation_state() {
+    let descriptors = desired_descriptors();
+    let database_name = SqlIdentifier::new("app-db").unwrap();
+    let database_identity = owned_standalone_database().identity.unwrap();
+    assert_eq!(
+        classify_availability_group(
+            None,
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            None,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Absent
+    );
+    let complete = bound_snapshot();
+    let complete_group = match &complete.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_availability_group(
+            Some(complete_group),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut no_database = complete_group.clone();
+    no_database.databases.clear();
+    assert_eq!(
+        classify_availability_group(
+            Some(&no_database),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            None,
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    assert_eq!(
+        classify_availability_group(
+            Some(complete_group),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            None,
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut unrelated_database = complete_group.clone();
+    unrelated_database.databases[0].identity.name = SqlIdentifier::new("other-db").unwrap();
+    assert_eq!(
+        classify_availability_group(
+            Some(&unrelated_database),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut foreign_database = complete_group.clone();
+    foreign_database.databases[0]
+        .local
+        .as_mut()
+        .unwrap()
+        .recovery
+        .as_mut()
+        .unwrap()
+        .family_guid = Some(guid(AG_ID));
+    assert_eq!(
+        classify_availability_group(
+            Some(&foreign_database),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut multiple_databases = complete_group.clone();
+    multiple_databases
+        .databases
+        .push(multiple_databases.databases[0].clone());
+    assert_eq!(
+        classify_availability_group(
+            Some(&multiple_databases),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut incomplete = complete_group.clone();
+    incomplete.replicas.pop();
+    assert_eq!(
+        classify_availability_group(
+            Some(&incomplete),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut conflicting = complete_group.clone();
+    conflicting.replicas[0].seeding_mode = "MANUAL".into();
+    assert_eq!(
+        classify_availability_group(
+            Some(&conflicting),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut foreign_member = complete_group.clone();
+    foreign_member.replicas[2] = replica(THIRD_ID, "foreign-sql");
+    assert_eq!(
+        classify_availability_group(
+            Some(&foreign_member),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_availability_group(
+            Some(complete_group),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            true,
+        ),
+        NativeConvergenceState::Unsafe
+    );
+
+    let secondary = bound_snapshot_for(1);
+    let secondary_group = match &secondary.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_replica_join(
+            None,
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Absent
+    );
+    assert_eq!(
+        classify_replica_join(
+            Some(secondary_group),
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut join_incomplete = secondary_group.clone();
+    join_incomplete.local_replica.state_available = false;
+    join_incomplete.local_replica.role = None;
+    assert_eq!(
+        classify_replica_join(
+            Some(&join_incomplete),
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut join_conflict = secondary_group.clone();
+    join_conflict.replicas[1].endpoint_url = Some("TCP://other:5022".into());
+    assert_eq!(
+        classify_replica_join(
+            Some(&join_conflict),
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_replica_join(
+            Some(secondary_group),
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            true,
+        ),
+        NativeConvergenceState::Unsafe
+    );
+    for wrong_group in [
+        AvailabilityGroupIdentity {
+            name: AvailabilityGroupName::new("other-ag").unwrap(),
+            group_id: complete_group.identity.group_id.clone(),
+        },
+        AvailabilityGroupIdentity {
+            name: complete_group.identity.name.clone(),
+            group_id: guid(FORK_ID),
+        },
+    ] {
+        assert_eq!(
+            classify_replica_join(
+                Some(secondary_group),
+                &wrong_group,
+                &sql_identity(1),
+                &ServerName::new("sql-1").unwrap(),
+                "TCP://sql-1:5022",
+                false,
+            ),
+            NativeConvergenceState::Conflicting
+        );
+    }
+
+    let lineage = expected_lineage();
+    assert_eq!(
+        classify_replica_seed(
+            Some(secondary_group),
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut seed_incomplete = secondary_group.clone();
+    seed_incomplete.databases[0].replicas[0].synchronization_state = None;
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_incomplete),
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut seed_conflict = secondary_group.clone();
+    seed_conflict.databases[0].replicas[0].lineage = RecoveryLineageObservation::Local {
+        value: DatabaseLineage {
+            database: lineage.database.clone(),
+            recovery_fork_id: guid(AG_ID),
+        },
+    };
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_conflict),
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut seed_failed_then_completed = secondary_group.clone();
+    seed_failed_then_completed
+        .automatic_seeding
+        .push(AutomaticSeedingSnapshot {
+            group_database_id: lineage.database.group_database_id.clone(),
+            remote_replica_id: guid(SECOND_ID),
+            operation_id: guid(AG_ID),
+            is_source: true,
+            current_state: Some("FAILED".into()),
+            performed_seeding: Some(false),
+            failure_state: Some(1),
+            error_code: Some(1),
+            number_of_attempts: Some(1),
+            start_time: None,
+            completion_time: None,
+        });
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_failed_then_completed),
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    for wrong_group in [
+        AvailabilityGroupIdentity {
+            name: AvailabilityGroupName::new("other-ag").unwrap(),
+            group_id: complete_group.identity.group_id.clone(),
+        },
+        AvailabilityGroupIdentity {
+            name: complete_group.identity.name.clone(),
+            group_id: guid(FORK_ID),
+        },
+    ] {
+        assert_eq!(
+            classify_replica_seed(
+                Some(secondary_group),
+                &wrong_group,
+                &lineage.database,
+                &lineage,
+                &guid(SECOND_ID),
+                false,
+            ),
+            NativeConvergenceState::Conflicting
+        );
+    }
+    assert_eq!(
+        classify_replica_seed(
+            None,
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Absent
+    );
+}
+
 fn bound_snapshot() -> InstanceSnapshot {
     bound_snapshot_for(0)
 }
@@ -416,6 +1463,1188 @@ fn bound_snapshot_for(local_index: usize) -> InstanceSnapshot {
         }],
     }];
     sample
+}
+
+fn bootstrap_absent_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bound_snapshot_for(local_index);
+    sample.availability_group = Observation::Absent {
+        observed_at_unix_millis: OBSERVED_AT,
+    };
+    sample
+}
+
+fn bootstrap_membership_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bound_snapshot_for(local_index);
+    let group = match &mut sample.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    group.databases.clear();
+    if local_index == 0 {
+        for (index, replica) in group.replicas.iter_mut().enumerate() {
+            replica.state = Some(ReplicaState {
+                provenance: if index == 0 {
+                    NativeProvenance::Local
+                } else {
+                    NativeProvenance::PrimaryRemote
+                },
+                role: Some(if index == 0 {
+                    NativeRole::Primary
+                } else {
+                    NativeRole::Secondary
+                }),
+                operational_state: Some("ONLINE".into()),
+                connected_state: Some("CONNECTED".into()),
+                recovery_health: Some("ONLINE".into()),
+                synchronization_health: Some("HEALTHY".into()),
+                last_connect_error_number: Some(0),
+            });
+        }
+    }
+    sample
+}
+
+fn bootstrap_membership_snapshot_with_sequence(
+    local_index: usize,
+    sequence: &str,
+) -> InstanceSnapshot {
+    let mut sample = bootstrap_membership_snapshot(local_index);
+    match &mut sample.availability_group {
+        Observation::Present { value, .. } => {
+            value.configuration_sequence = ConfigurationSequence::parse(sequence).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    sample
+}
+
+fn seeded_source_snapshot() -> InstanceSnapshot {
+    let mut sample = bootstrap_membership_snapshot(0);
+    let source_database = match bound_snapshot_for(0).availability_group {
+        Observation::Present { value, .. } => value.databases[0].clone(),
+        _ => unreachable!(),
+    };
+    let group = match &mut sample.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    group.databases.push(source_database);
+    let database = group.databases.first_mut().unwrap();
+    for (index, native_id) in [SECOND_ID, THIRD_ID].into_iter().enumerate() {
+        database.replicas.push(DatabaseReplicaSnapshot {
+            group_database_id: guid(DATABASE_ID),
+            replica_id: guid(native_id),
+            database_id: 5,
+            provenance: NativeProvenance::PrimaryRemote,
+            lineage: RecoveryLineageObservation::RemoteUnavailable,
+            is_primary_replica: Some(false),
+            synchronization_state: Some("SYNCHRONIZED".into()),
+            synchronization_health: Some("HEALTHY".into()),
+            database_state: None,
+            is_suspended: Some(false),
+            suspend_reason: None,
+            is_commit_participant: Some(true),
+            progress: NativeProgress {
+                hardened_block: Some(DecimalProgress::parse("100").unwrap()),
+                redone_record: Some(DecimalProgress::parse("100").unwrap()),
+                committed_record: Some(DecimalProgress::parse("100").unwrap()),
+            },
+        });
+        group.automatic_seeding.push(AutomaticSeedingSnapshot {
+            group_database_id: guid(DATABASE_ID),
+            remote_replica_id: guid(native_id),
+            operation_id: guid(
+                [
+                    "99999999-9999-4999-8999-999999999999",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                ][index],
+            ),
+            is_source: true,
+            current_state: Some("COMPLETED".into()),
+            performed_seeding: Some(true),
+            failure_state: Some(0),
+            error_code: Some(0),
+            number_of_attempts: Some(1),
+            start_time: Some("2026-10-08T23:00:00".into()),
+            completion_time: Some("2026-10-08T23:00:01".into()),
+        });
+    }
+    sample
+}
+
+fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
+    let identity = StandaloneDatabaseIdentity {
+        name: SqlIdentifier::new("app-db").unwrap(),
+        database_guid: guid(DATABASE_GUID),
+        family_guid: guid(FAMILY_GUID),
+        recovery_fork_guid: guid(FORK_ID),
+    };
+    let ownership = StandaloneDatabaseOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+    };
+    StandaloneDatabaseSnapshot {
+        identity: Some(identity.clone()),
+        creation_token: Some(source_database_creation_token(&identity.name, &ownership)),
+        ownership: Some(ownership),
+        availability_group_ownership: Some(AvailabilityGroupOwnership {
+            resource_id: "resource-a".into(),
+            configuration_id: configuration().configuration_id.to_string(),
+            name: AvailabilityGroupName::new("test-ag").unwrap(),
+            creation_group_id: Some(guid(AG_ID)),
+            group_id: Some(guid(AG_ID)),
+        }),
+        state: "ONLINE".into(),
+        recovery_model: "FULL".into(),
+        accessible: true,
+        marker_table_ready: true,
+        full_backup_ready: true,
+        log_chain_ready: true,
+        backup_verified: true,
+    }
+}
+
+fn owned_standalone_database_without_group_intent() -> StandaloneDatabaseSnapshot {
+    let mut snapshot = owned_standalone_database();
+    snapshot.availability_group_ownership = None;
+    snapshot
+}
+
+fn owned_standalone_database_with_group_intent() -> StandaloneDatabaseSnapshot {
+    let mut snapshot = owned_standalone_database();
+    snapshot
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .group_id = None;
+    snapshot
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .creation_group_id = None;
+    snapshot
+}
+
+#[test]
+fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_secondary_forks() {
+    let descriptors = desired_descriptors();
+    let database_name = SqlIdentifier::new("app-db").unwrap();
+    let database_identity = owned_standalone_database().identity.unwrap();
+    let expected_group_ownership = AvailabilityGroupOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+        name: AvailabilityGroupName::new("test-ag").unwrap(),
+        creation_group_id: None,
+        group_id: None,
+    };
+    let complete = bound_snapshot();
+    let complete_group = match &complete.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(complete_group),
+            None,
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+
+    let intent = AvailabilityGroupOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+        name: AvailabilityGroupName::new("test-ag").unwrap(),
+        creation_group_id: None,
+        group_id: None,
+    };
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(complete_group),
+            Some(&intent),
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+
+    let frozen = owned_standalone_database()
+        .availability_group_ownership
+        .unwrap();
+    let mut recreated = complete_group.clone();
+    recreated.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(&recreated),
+            Some(&frozen),
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_replica_join(
+            Some(&recreated),
+            &complete_group.identity,
+            &recreated.local_replica.identity,
+            &recreated.replicas[0].server_name,
+            recreated.replicas[0].endpoint_url.as_deref().unwrap(),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+}
+
+#[tokio::test]
+async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from_native_state() {
+    let (primary, primary_mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_absent_snapshot(0))),
+            Ok(present(bootstrap_absent_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+        ],
+        vec![
+            Ok(None),
+            Ok(Some(owned_standalone_database_without_group_intent())),
+            Ok(Some(owned_standalone_database_with_group_intent())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    primary.open().await.unwrap();
+    primary
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    let mut omitted_remote_transport = bound_replica_set();
+    for replica in &mut omitted_remote_transport.replicas[1..] {
+        replica.process_session_id = ProcessSessionId::default();
+        replica.replication_address.clear();
+        replica.role = ReplicaRole::None;
+    }
+    primary
+        .update_current_replica_set_configuration(omitted_remote_transport)
+        .await
+        .unwrap();
+    let admitted = primary.admitted_topology().unwrap();
+    assert!(admitted.members()[1..].iter().all(|member| {
+        !member.process_session_id().is_empty() && !member.replication_address().is_empty()
+    }));
+    primary
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert_eq!(
+        *primary_mutation.effects.lock().unwrap(),
+        vec![
+            "retain source database creation intent",
+            "retain availability group intent",
+            "retain availability group creation intent"
+        ]
+    );
+    assert!(
+        primary
+            .admitted_topology()
+            .unwrap()
+            .database_lineage()
+            .is_none()
+    );
+    assert_eq!(primary.current_progress().await.unwrap(), 42);
+
+    for local_index in [1, 2] {
+        let (secondary, mutation) = bootstrap_replicator_for(
+            local_index,
+            vec![
+                Ok(present(bootstrap_absent_snapshot(local_index))),
+                Ok(present(pending_secondary_join_snapshot(local_index))),
+                Ok(present(bootstrap_membership_snapshot(local_index))),
+                Ok(present(bootstrap_membership_snapshot(local_index))),
+            ],
+            vec![
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ],
+        );
+        secondary.open().await.unwrap();
+        secondary
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        secondary
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        assert_eq!(
+            *mutation.effects.lock().unwrap(),
+            vec!["join availability group"]
+        );
+        assert!(secondary.admitted_topology().is_some());
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_path_fails_closed_on_foreign_standalone_database() {
+    let mut foreign = owned_standalone_database();
+    foreign.ownership = Some(StandaloneDatabaseOwnership {
+        resource_id: "foreign-resource".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+    });
+    let (replicator, mutation) = bootstrap_replicator_for(0, Vec::new(), vec![Ok(Some(foreign))]);
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_restart_requires_the_frozen_availability_group_marker() {
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![Ok(Some(unmarked))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+
+    let mut recreated = bootstrap_membership_snapshot(0);
+    if let Observation::Present { value: group, .. } = &mut recreated.availability_group {
+        group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![Ok(present(recreated))],
+        vec![Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn secondary_restart_rejects_a_local_same_name_group_with_a_different_primary_guid() {
+    let mut fork = bootstrap_membership_snapshot(1);
+    if let Observation::Present { value: group, .. } = &mut fork.availability_group {
+        group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        1,
+        vec![Ok(present(fork))],
+        vec![Ok(None), Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn current_configuration_replay_revalidates_availability_group_ownership() {
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![Ok(Some(owned_standalone_database())), Ok(Some(unmarked))],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn seed_build_revalidates_the_exact_availability_group_guid_marker() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![Ok(Some(owned_standalone_database())), Ok(Some(unmarked))].into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(
+                    vec![
+                        Ok(present(bootstrap_membership_snapshot(0))),
+                        Ok(present(bootstrap_membership_snapshot(0))),
+                    ]
+                    .into(),
+                ),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            root.path().to_owned(),
+        )
+        .unwrap(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let error = replicator
+        .build_replica(target_build(1, "unmarked-seed-build"))
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("ownership marker"));
+    assert!(executor.effects.lock().unwrap().is_empty());
+}
+
+fn mutation_error(code: u32) -> RuntimeError {
+    let mut error = RuntimeError::new(
+        ObservationFailureKind::Unsupported,
+        "scripted mutation",
+        "scripted SQL Server mutation failure",
+    );
+    error.server_code = Some(code);
+    error
+}
+
+fn pending_secondary_join_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bootstrap_membership_snapshot(local_index);
+    let group = match &mut sample.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    group.local_replica.state_available = false;
+    group.local_replica.role = Some(NativeRole::NotJoined);
+    let local_id = group.local_replica.identity.native_replica_id().unwrap();
+    group
+        .replicas
+        .iter_mut()
+        .find(|replica| replica.replica_id == *local_id)
+        .unwrap()
+        .state = None;
+    sample
+}
+
+#[tokio::test(start_paused = true)]
+async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propagation() {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(vec![Err(mutation_error(35250))].into()),
+    });
+    let source = Arc::new(CountingSource {
+        inner: ScriptedSource {
+            config: observer_config_for_timing(1, 5_000, 2_000),
+            samples: Mutex::new(
+                vec![
+                    Ok(present(bootstrap_absent_snapshot(1))),
+                    Ok(present(bootstrap_absent_snapshot(1))),
+                    Ok(present(bootstrap_membership_snapshot(1))),
+                ]
+                .into(),
+            ),
+        },
+        observations: AtomicUsize::new(0),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-2.example:5022")
+                .unwrap(),
+            source.clone(),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(2),
+            topology_expectation_for(1),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(executor.effects.lock().unwrap().is_empty());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(executor.effects.lock().unwrap().is_empty());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *executor.effects.lock().unwrap(),
+        vec!["join availability group"]
+    );
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+    assert!(replicator.admitted_topology().is_some());
+}
+
+#[tokio::test]
+async fn secondary_join_does_not_retry_arbitrary_sql_errors() {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(vec![Err(mutation_error(50000))].into()),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-2.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config_for(1),
+                samples: Mutex::new(vec![Ok(present(pending_secondary_join_snapshot(1)))].into()),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(2),
+            topology_expectation_for(1),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("SQL Server error 50000"));
+    assert_eq!(
+        *executor.effects.lock().unwrap(),
+        vec!["join availability group"]
+    );
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_retries_partial_membership_and_rejects_wrong_member_or_profile() {
+    let mut partial = bootstrap_membership_snapshot(0);
+    match &mut partial.availability_group {
+        Observation::Present { value, .. } => {
+            value.replicas.pop();
+        }
+        _ => unreachable!(),
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(partial)),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert!(mutation.effects.lock().unwrap().is_empty());
+
+    let mut wrong_member = bootstrap_membership_snapshot(0);
+    match &mut wrong_member.availability_group {
+        Observation::Present { value, .. } => {
+            value.replicas[2] = replica(THIRD_ID, "foreign-sql");
+        }
+        _ => unreachable!(),
+    }
+    let mut wrong_profile = bootstrap_membership_snapshot(0);
+    match &mut wrong_profile.availability_group {
+        Observation::Present { value, .. } => {
+            value.replicas[1].seeding_mode = "MANUAL".into();
+        }
+        _ => unreachable!(),
+    }
+    for sample in [wrong_member, wrong_profile] {
+        let (replicator, mutation) = bootstrap_replicator_for(
+            0,
+            vec![Ok(present(sample))],
+            vec![Ok(Some(owned_standalone_database()))],
+        );
+        replicator.open().await.unwrap();
+        let error = replicator
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap_err();
+        assert!(application_error(error).contains("conflicts"));
+        assert!(mutation.effects.lock().unwrap().is_empty());
+        assert!(replicator.admitted_topology().is_none());
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_retries_only_inconsistent_observation_propagation() {
+    let propagation = RuntimeError::new(
+        ObservationFailureKind::Inconsistent,
+        "scripted observation",
+        "native state changed during the observation bracket",
+    );
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Err(propagation),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert!(mutation.effects.lock().unwrap().is_empty());
+
+    let unavailable = RuntimeError::new(
+        ObservationFailureKind::Unreachable,
+        "scripted observation",
+        "native endpoint is unavailable",
+    );
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![Err(unavailable)],
+        vec![Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("Unreachable"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(replicator.admitted_topology().is_none());
+}
+
+fn inconsistent_bootstrap_observation() -> RuntimeError {
+    RuntimeError::new(
+        ObservationFailureKind::Inconsistent,
+        "scripted observation",
+        "native state changed during the observation bracket",
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_honors_configured_poll_interval_and_exact_success_is_immediate() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![
+            Err(inconsistent_bootstrap_observation()),
+            Err(inconsistent_bootstrap_observation()),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+        observer_config_for_timing(0, 5_000, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_applies_the_minimum_poll_floor() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![
+            Err(inconsistent_bootstrap_observation()),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+        observer_config_for_timing(0, 1_000, 1),
+    );
+    replicator.open().await.unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_bootstrap_retry_does_not_wait_for_the_poll_interval() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![Err(inconsistent_bootstrap_observation())],
+        vec![Ok(Some(owned_standalone_database()))],
+        observer_config_for_timing(0, 5_000, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_stops_at_the_exact_callback_deadline() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![Err(inconsistent_bootstrap_observation())],
+        vec![Ok(Some(owned_standalone_database()))],
+        observer_config_for_timing(0, 250, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(249)).await;
+    tokio::task::yield_now().await;
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let error = callback.await.unwrap().unwrap_err();
+    assert!(application_error(error).contains("bounded callback budget"));
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn bootstrap_admission_accepts_only_exact_owned_database_association() {
+    let mut exact = bootstrap_membership_snapshot(0);
+    let exact_database = match bound_snapshot().availability_group {
+        Observation::Present { value, .. } => value.databases[0].clone(),
+        _ => unreachable!(),
+    };
+    match &mut exact.availability_group {
+        Observation::Present { value, .. } => {
+            value.databases.push(exact_database);
+        }
+        _ => unreachable!(),
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![Ok(present(exact.clone()))],
+        vec![Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(
+        replicator
+            .admitted_topology()
+            .unwrap()
+            .database_lineage()
+            .is_some()
+    );
+
+    let mut foreign = exact;
+    match &mut foreign.availability_group {
+        Observation::Present { value, .. } => {
+            value.databases[0]
+                .local
+                .as_mut()
+                .unwrap()
+                .recovery
+                .as_mut()
+                .unwrap()
+                .family_guid = Some(guid(AG_ID));
+        }
+        _ => unreachable!(),
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![Ok(present(foreign))],
+        vec![Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn callback_deadline_cancels_gated_observation_before_it_can_publish() {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(GatedSource {
+                config: observer_config_for_timeout(0, 20),
+                samples: Mutex::new(vec![Ok(present(bootstrap_membership_snapshot(0)))].into()),
+                observations: AtomicUsize::new(0),
+                gate_at: 0,
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor,
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("callback must finish at its parent deadline")
+        .unwrap()
+        .unwrap_err();
+    assert!(application_error(error).contains("bounded callback budget"));
+    assert!(release_tx.send(()).is_err());
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn callback_deadline_cancels_gated_mutation_before_it_can_publish() {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let executor = Arc::new(GatedMutationExecutor {
+        databases: Mutex::new(vec![Ok(None)].into()),
+        effects: Mutex::new(Vec::new()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config_for_timeout(0, 20),
+                samples: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("callback must finish at its parent deadline")
+        .unwrap()
+        .unwrap_err();
+    assert!(application_error(error).contains("bounded callback budget"));
+    assert!(release_tx.send(()).is_err());
+    assert_eq!(
+        *executor.effects.lock().unwrap(),
+        vec!["retain source database creation intent"]
+    );
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn lifecycle_supersession_fences_a_late_mutation_completion() {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let executor = Arc::new(GatedMutationExecutor {
+        databases: Mutex::new(vec![Ok(None)].into()),
+        effects: Mutex::new(Vec::new()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor,
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn close_during_bootstrap_reobservation_fences_configuration_success() {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(vec![Ok(Some(owned_standalone_database()))].into()),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(GatedSource {
+                config: observer_config(),
+                samples: Mutex::new(vec![Ok(present(bootstrap_membership_snapshot(0)))].into()),
+                observations: AtomicUsize::new(0),
+                gate_at: 0,
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor,
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.close().await.unwrap();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(replicator.admitted_topology().is_none());
 }
 
 fn bound_replica_set() -> ReplicaSetConfiguration {
@@ -577,6 +2806,282 @@ fn bound_replicator_for(
         )
         .unwrap(),
     )
+}
+
+fn bootstrap_replicator_for(
+    local_index: usize,
+    samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
+    databases: Vec<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>,
+) -> (Arc<SqlServerReplicator>, Arc<ScriptedMutationExecutor>) {
+    let (replicator, executor, _) = counted_bootstrap_replicator_for(
+        local_index,
+        samples,
+        databases,
+        observer_config_for(local_index),
+    );
+    (replicator, executor)
+}
+
+fn counted_bootstrap_replicator_for(
+    local_index: usize,
+    samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
+    databases: Vec<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>,
+    config: ObserverConfig,
+) -> (
+    Arc<SqlServerReplicator>,
+    Arc<ScriptedMutationExecutor>,
+    Arc<CountingSource>,
+) {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(databases.into()),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let source = Arc::new(CountingSource {
+        inner: ScriptedSource {
+            config,
+            samples: Mutex::new(samples.into()),
+        },
+        observations: AtomicUsize::new(0),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(
+                ResourceUid::new("resource-a"),
+                format!("replica-{}.example:5022", local_index + 1),
+            )
+            .unwrap(),
+            source.clone(),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(local_index as i64 + 1),
+            topology_expectation_for(local_index),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            private_seed_root(),
+        )
+        .unwrap(),
+    );
+    (replicator, executor, source)
+}
+
+fn seed_replicator(
+    root: std::path::PathBuf,
+) -> (
+    Arc<SqlServerReplicator>,
+    Arc<SeedMutationExecutor>,
+    Arc<AtomicBool>,
+) {
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_executor(
+        root,
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    (replicator, executor, complete)
+}
+
+fn seed_replicator_with_executor(
+    root: std::path::PathBuf,
+    complete: Arc<AtomicBool>,
+    executor: Arc<dyn SqlMutationExecutor>,
+) -> Arc<SqlServerReplicator> {
+    seed_replicator_with_executor_and_target_evidence(
+        root,
+        complete.clone(),
+        executor,
+        Arc::new(SeedTargetEvidenceExchange { complete }),
+    )
+}
+
+fn seed_replicator_with_executor_and_target_evidence(
+    root: std::path::PathBuf,
+    complete: Arc<AtomicBool>,
+    executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+) -> Arc<SqlServerReplicator> {
+    seed_replicator_with_config_and_target_evidence(
+        root,
+        complete,
+        executor,
+        target_evidence,
+        observer_config(),
+    )
+}
+
+fn seed_replicator_with_config_and_target_evidence(
+    root: std::path::PathBuf,
+    complete: Arc<AtomicBool>,
+    executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+    config: ObserverConfig,
+) -> Arc<SqlServerReplicator> {
+    Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(SeedSource { config, complete }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor,
+            target_evidence,
+            root,
+        )
+        .unwrap(),
+    )
+}
+
+fn terminal_seed_replicator(
+    root: std::path::PathBuf,
+) -> (
+    Arc<SqlServerReplicator>,
+    Arc<TerminalSeedMutationExecutor>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+) {
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let associated = Arc::new(AtomicBool::new(false));
+    let replaced_group = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(TerminalSeedMutationExecutor {
+        associated: associated.clone(),
+        terminal: Arc::new(AtomicBool::new(false)),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(TerminalSeedSource {
+                config: observer_config(),
+                associated: associated.clone(),
+                replaced_group: replaced_group.clone(),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            Arc::new(SeedTargetEvidenceExchange {
+                complete: associated.clone(),
+            }),
+            root,
+        )
+        .unwrap(),
+    );
+    (replicator, executor, associated, replaced_group)
+}
+
+async fn admit_seed_replicator(replicator: &SqlServerReplicator) {
+    admit_seed_replicator_with_sessions(replicator, "session").await;
+}
+
+async fn admit_seed_replicator_with_sessions(
+    replicator: &SqlServerReplicator,
+    session_prefix: &str,
+) {
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(replica_set_with_session_prefix(session_prefix))
+        .await
+        .unwrap();
+    replicator
+        .change_role(configuration().epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+}
+
+fn target_build(target_index: usize, build_id: &str) -> ReplicaInformation {
+    target_build_with_sessions(target_index, build_id, "session")
+}
+
+fn target_build_with_sessions(
+    target_index: usize,
+    build_id: &str,
+    session_prefix: &str,
+) -> ReplicaInformation {
+    let current = replica_set_with_session_prefix(session_prefix);
+    let target = &current.replicas[target_index];
+    let mut build = ReplicaInformation::new(
+        OperationId::new(build_id),
+        target.identity.clone(),
+        target.replication_address.clone(),
+    );
+    build.process_session_id = target.process_session_id.clone();
+    build
+}
+
+fn exact_seed_record(winning_target: usize, build_id: &str) -> SeedDispatchRecord {
+    exact_seed_record_with_sessions(winning_target, build_id, "session")
+}
+
+fn exact_seed_record_with_sessions(
+    winning_target: usize,
+    build_id: &str,
+    session_prefix: &str,
+) -> SeedDispatchRecord {
+    let current = replica_set_with_session_prefix(session_prefix);
+    let member = |index: usize| {
+        let kuberic = &current.replicas[index];
+        SeedDispatchTarget::new(
+            kuberic.identity.replica_id.to_string(),
+            kuberic.identity.instance_id.to_string(),
+            kuberic.identity.agent_generation.to_string(),
+            kuberic.process_session_id.to_string(),
+            [LOCAL_ID, SECOND_ID, THIRD_ID][index],
+        )
+        .unwrap()
+    };
+    SeedDispatchRecord::new(
+        "resource-a",
+        configuration().configuration_id.to_string(),
+        "test-ag",
+        AG_ID,
+        "app-db",
+        DATABASE_GUID,
+        FAMILY_GUID,
+        FORK_ID,
+        member(0),
+        [member(1), member(2)],
+        current.replicas[winning_target]
+            .identity
+            .replica_id
+            .to_string(),
+        build_id,
+        "2026-10-06T12:00:00",
+    )
+    .unwrap()
+}
+
+fn write_legacy_dispatched_seed_record(
+    root: &std::path::Path,
+    winning_target: usize,
+    build_id: &str,
+) {
+    let mut legacy = serde_json::to_value(exact_seed_record_with_sessions(
+        winning_target,
+        build_id,
+        "historical-session",
+    ))
+    .unwrap();
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy["revision"] = serde_json::json!(2);
+    legacy["phase"] = serde_json::json!("dispatched");
+    legacy.as_object_mut().unwrap().remove("operation_token");
+    let path = root.join("seed-dispatch-v1.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn gated_bound_replicator(
@@ -1792,7 +4297,8 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
         assert!(
             message.contains("binding mismatch")
                 || message.contains("identities differ")
-                || message.contains("configuration or state"),
+                || message.contains("configuration or state")
+                || (name == "process restart" && message.contains("unsafe to continue")),
             "{name}: {message}"
         );
     }
@@ -2004,6 +4510,1400 @@ async fn abort_during_capability_observation_cannot_return_fresh_progress() {
         task.await.unwrap(),
         Err(KubericRuntimeError::Closed)
     ));
+}
+
+#[tokio::test]
+async fn concurrent_target_builds_select_one_dispatch_and_replay_from_native_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, complete) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+
+    let first = target_build(1, "build-target-2");
+    let second = target_build(2, "build-target-3");
+    let (first_result, second_result) = tokio::join!(
+        replicator.build_replica(first.clone()),
+        replicator.build_replica(second.clone())
+    );
+    first_result.unwrap();
+    second_result.unwrap();
+
+    assert!(complete.load(Ordering::SeqCst));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+
+    replicator.build_replica(first).await.unwrap();
+    replicator.build_replica(second).await.unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn slow_seed_store_open_and_read_never_block_async_runtime_workers() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+
+    let open_gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Open,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let first = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "slow-store-open"))
+                .await
+        }
+    });
+    open_gate.entered.notified().await;
+    let successor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "concurrent-slow-store-open"))
+                .await
+        }
+    });
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!first.is_finished());
+    assert!(!successor.is_finished());
+    open_gate.release();
+    first.await.unwrap().unwrap();
+    successor.await.unwrap().unwrap();
+
+    let load_gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Load,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let replay = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "slow-store-read"))
+                .await
+        }
+    });
+    load_gate.entered.notified().await;
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!replay.is_finished());
+    load_gate.release();
+    replay.await.unwrap().unwrap();
+
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_cancellation_before_commit_is_a_noop_and_successor_can_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let cancelled = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "cancel-before-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    replicator
+        .build_replica(target_build(2, "successor-after-cancelled-store-commit"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_cancellation_after_commit_start_joins_before_successor_mutates() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let cancelled = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "cancel-after-store-commit-start"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let successor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "serialized-store-successor"))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!successor.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!successor.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    gate.release();
+    successor.await.unwrap().unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn lifecycle_cancellation_is_stateful_while_waiting_for_store_serialization() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Open,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let first = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "store-owner-before-abort"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let waiting = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "store-waiter-before-abort"))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    replicator.abort();
+    assert!(matches!(
+        waiting.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(!first.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    gate.release();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lifecycle_cancellation_before_store_commit_wins_without_durable_change() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "lifecycle-cancel-before-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    replicator.abort();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_deadline_before_commit_is_a_noop() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_config_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+        Arc::new(SeedTargetEvidenceExchange { complete }),
+        observer_config_for_timeout(0, 250),
+    );
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "deadline-before-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let message = application_error(callback.await.unwrap().unwrap_err());
+    assert!(message.contains("bounded callback budget"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_deadline_after_commit_classifies_durability_before_returning_no_success() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_config_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+        Arc::new(SeedTargetEvidenceExchange {
+            complete: complete.clone(),
+        }),
+        observer_config_for_timeout(0, 250),
+    );
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::Completed,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "deadline-after-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    assert!(root.path().join("seed-dispatch-v1.json").exists());
+    let message = application_error(callback.await.unwrap().unwrap_err());
+    assert!(message.contains("bounded callback budget"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Intent);
+
+    replicator
+        .build_replica(target_build(2, "successor-after-store-deadline"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_convergence_waits_for_the_retry_floor_after_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, complete) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "paced-seed-build"))
+                .await
+        }
+    });
+
+    tokio::task::spawn_blocking({
+        let complete = complete.clone();
+        move || {
+            while !complete.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(complete.load(Ordering::SeqCst));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::sleep(Duration::from_millis(99)).await;
+    assert!(!callback.is_finished());
+    callback.await.unwrap().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn target_host_evidence_gates_completion_and_rejects_stale_build_session_replay() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let exchange = Arc::new(ControlledTargetEvidenceExchange::with_gate(
+        [
+            ControlledTargetEvidenceMode::Healthy,
+            ControlledTargetEvidenceMode::ReplayPreviousAuthority,
+        ],
+        entered_tx,
+        release_rx,
+    ));
+    let replicator = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone(),
+        exchange.clone(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "evidence-gated-build"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    assert!(
+        !callback.is_finished(),
+        "primary-side native completion published before target-local evidence"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    release_tx.send(()).unwrap();
+    callback.await.unwrap().unwrap();
+    drop(replicator);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone(),
+        exchange,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    let message = application_error(
+        replacement
+            .build_replica(target_build_with_sessions(
+                1,
+                "replacement-build",
+                "replacement-session",
+            ))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("target-host evidence authority"),
+        "{message}"
+    );
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn target_host_evidence_rejects_stale_restart_and_lineage_reports() {
+    for (mode, expected) in [
+        (ControlledTargetEvidenceMode::Stale, "stale"),
+        (ControlledTargetEvidenceMode::SqlRestarted, "is unsafe"),
+        (ControlledTargetEvidenceMode::LineageMismatch, "conflicts"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let replicator = seed_replicator_with_executor_and_target_evidence(
+            root.path().to_owned(),
+            complete,
+            executor.clone(),
+            Arc::new(ControlledTargetEvidenceExchange::new([mode])),
+        );
+        admit_seed_replicator(&replicator).await;
+        let message = application_error(
+            replicator
+                .build_replica(target_build(1, "invalid-target-evidence"))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains(expected), "{mode:?}: {message}");
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn either_single_target_can_own_group_dispatch_without_a_peer_build() {
+    for (target_index, build_id) in [(1, "only-target-2"), (2, "only-target-3")] {
+        let root = tempfile::tempdir().unwrap();
+        let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+        admit_seed_replicator(&replicator).await;
+
+        replicator
+            .build_replica(target_build(target_index, build_id))
+            .await
+            .unwrap();
+
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+        assert!(!root.path().join("seed-dispatch-v1.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn build_rejects_changed_session_before_dispatch_and_corrupt_seed_state_on_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+
+    let mut stale = target_build(1, "stale-session-build");
+    stale.process_session_id = ProcessSessionId::new("stale-session");
+    let message = application_error(replicator.build_replica(stale).await.unwrap_err());
+    assert!(message.contains("session"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    std::fs::write(root.path().join("seed-dispatch-v1.json"), b"{corrupt").unwrap();
+    std::fs::set_permissions(
+        root.path().join("seed-dispatch-v1.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let message = application_error(
+        replicator
+            .build_replica(target_build(1, "corrupt-state-build"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("malformed"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn winner_cancellation_before_durable_dispatch_allows_safe_rearbitration() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let first_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    first
+        .testing_gate_seed_intent(entered_tx, release_rx)
+        .unwrap();
+
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "cancel-before-dispatch"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Intent);
+    first.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 0);
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "rearbitrated-winner",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn crash_immediately_before_request_submission_retries_from_submitting_without_false_acceptance()
+ {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let first_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    first
+        .testing_gate_seed_submission(entered_tx, release_rx)
+        .unwrap();
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "crash-before-request"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 0);
+    first.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "retry-after-pre-submit-crash",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn crash_immediately_after_request_submission_retries_after_proven_pre_effect_failure() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let first_executor = Arc::new(SubmittedThenFailedSeedExecutor {
+        executions: AtomicUsize::new(0),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "crash-after-request"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    drop(release_tx);
+    tokio::task::yield_now().await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            1,
+            "retry-after-post-submit-crash",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn accepted_sql_with_lost_reply_replays_from_native_evidence_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(AcceptedReplyLostSeedExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&replicator).await;
+    replicator
+        .build_replica(target_build(1, "accepted-reply-lost"))
+        .await
+        .unwrap();
+    replicator
+        .build_replica(target_build(1, "accepted-reply-lost"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn definite_sql_rejection_is_retryable_and_does_not_degrade_to_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(RejectOnceSeedExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&replicator).await;
+    let message = application_error(
+        replicator
+            .build_replica(target_build(1, "definite-rejection"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("SQL Server error 51001"), "{message}");
+    assert!(!message.contains("bounded callback budget"), "{message}");
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::FailedRetryable);
+
+    replicator
+        .build_replica(target_build(1, "definite-rejection"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 2);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn legacy_dispatched_restart_compacts_exact_native_effect_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
+
+    let complete = Arc::new(AtomicBool::new(true));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    let (first, second) = tokio::join!(
+        replacement.build_replica(target_build_with_sessions(
+            1,
+            "replacement-build-2",
+            "replacement-session",
+        )),
+        replacement.build_replica(target_build_with_sessions(
+            2,
+            "replacement-build-3",
+            "replacement-session",
+        )),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    let compacted: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(compacted.phase(), SeedDispatchPhase::LegacyAmbiguous);
+    assert_eq!(compacted.group_database_id(), Some(DATABASE_ID));
+    assert_eq!(compacted.operation_token(), "");
+    replacement.close().await.unwrap();
+    drop(replacement);
+
+    let replay_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replay = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replay_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replay, "same-root-restart").await;
+    replay
+        .build_replica(target_build_with_sessions(
+            1,
+            "same-root-replay",
+            "same-root-restart",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay_executor.executions.load(Ordering::SeqCst), 0);
+    assert!(root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn legacy_dispatched_restart_without_native_evidence_requires_recovery_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
+
+    for session in ["first-replacement", "same-root-restart"] {
+        let complete = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let replacement = seed_replicator_with_executor(
+            root.path().to_owned(),
+            complete,
+            executor.clone() as Arc<dyn SqlMutationExecutor>,
+        );
+        admit_seed_replicator_with_sessions(&replacement, session).await;
+        let message = application_error(
+            replacement
+                .build_replica(target_build_with_sessions(1, "replacement-build", session))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("operator recovery is required"),
+            "{message}"
+        );
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+        replacement.close().await.unwrap();
+        drop(replacement);
+
+        let persisted = std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(2));
+        assert_eq!(value["phase"], serde_json::json!("legacy_ambiguous"));
+        assert!(value.get("operation_token").is_none());
+        let record: SeedDispatchRecord = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(record.phase(), SeedDispatchPhase::LegacyAmbiguous);
+        assert_eq!(record.operation_token(), "");
+    }
+}
+
+#[tokio::test]
+async fn legacy_dispatched_restart_rejects_incomplete_and_conflicting_evidence_without_redispatch()
+{
+    let mut incomplete = seeded_source_snapshot();
+    if let Observation::Present { value: group, .. } = &mut incomplete.availability_group {
+        group.databases[0].local.as_mut().unwrap().recovery = None;
+    }
+    let mut conflicting = seeded_source_snapshot();
+    if let Observation::Present { value: group, .. } = &mut conflicting.availability_group {
+        group.databases[0]
+            .local
+            .as_mut()
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap()
+            .database_guid = Some(guid("99999999-9999-4999-8999-999999999999"));
+    }
+    for (label, snapshot, expected) in [
+        ("incomplete", incomplete, "operator recovery is required"),
+        ("conflicting", conflicting, "source database association"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
+        let associated = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: associated.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let replacement = Arc::new(
+            SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
+                SqlServerServiceConfig::new(
+                    ResourceUid::new("resource-a"),
+                    "replica-1.example:5022",
+                )
+                .unwrap(),
+                Arc::new(ControlledSeedSource {
+                    config: observer_config(),
+                    associated: associated.clone(),
+                    associated_snapshot: snapshot,
+                }),
+                Arc::new(ScriptedClock {
+                    times: Mutex::new(vec![OBSERVED_AT].into()),
+                }),
+                kuberic_identity(1),
+                topology_expectation(),
+                SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+                executor.clone() as Arc<dyn SqlMutationExecutor>,
+                Arc::new(SeedTargetEvidenceExchange {
+                    complete: associated.clone(),
+                }),
+                root.path().to_owned(),
+            )
+            .unwrap(),
+        );
+        admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+        associated.store(true, Ordering::SeqCst);
+        let message = application_error(
+            replacement
+                .build_replica(target_build_with_sessions(
+                    1,
+                    "replacement-build",
+                    "replacement-session",
+                ))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(message.contains(expected), "{label}: {message}");
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0, "{label}");
+        let persisted = std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(value["phase"], serde_json::json!("legacy_ambiguous"));
+        assert!(value.get("operation_token").is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_durable_dispatch_restart_compacts_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let first_executor = Arc::new(GatedSeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "cancel-after-dispatch"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !complete.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.close().await.unwrap();
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&replacement).await;
+    replacement
+        .build_replica(target_build(2, "restart-native-only"))
+        .await
+        .unwrap();
+
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn compaction_checkpoint_fences_stale_callback_and_replacement_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let stale_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let stale = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        stale_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&stale).await;
+    stale
+        .testing_gate_seed_compaction(entered_tx, release_rx)
+        .unwrap();
+    let callback = tokio::spawn({
+        let stale = stale.clone();
+        async move {
+            stale
+                .build_replica(target_build(1, "superseded-dispatch"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Accepted);
+    stale.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(stale_executor.executions.load(Ordering::SeqCst), 1);
+    drop(stale);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "replacement-build",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn terminal_marker_rejects_post_compaction_source_association_loss_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, associated, _) = terminal_seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    replicator
+        .build_replica(target_build(1, "terminal-association-owner"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+
+    associated.store(false, Ordering::SeqCst);
+    let message = application_error(
+        replicator
+            .build_replica(target_build(2, "terminal-association-lost"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("terminal seed dispatch source association"),
+        "{message}"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn terminal_marker_rejects_post_compaction_availability_group_recreation_without_redispatch()
+{
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _, replaced_group) =
+        terminal_seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    replicator
+        .build_replica(target_build(1, "terminal-group-owner"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+
+    replaced_group.store(true, Ordering::SeqCst);
+    let message = application_error(
+        replicator
+            .build_replica(target_build(2, "terminal-group-recreated"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("availability group differs")
+            || message.contains("availability-group ownership"),
+        "{message}"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn restart_compacts_a_dispatch_crashed_after_source_association_before_removal() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        let store = SeedDispatchStore::open(root.path()).unwrap();
+        let intent = exact_seed_record_with_sessions(1, "historical-build", "historical-session");
+        store.create(&intent).unwrap();
+        let mut accepted = intent.clone();
+        accepted.mark_accepted().unwrap();
+        let mut associated = store.replace(intent.revision(), accepted).unwrap();
+        associated.associate_group_database(DATABASE_ID).unwrap();
+        store.replace(associated.revision(), associated).unwrap();
+    }
+
+    let complete = Arc::new(AtomicBool::new(true));
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            1,
+            "replacement-build",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn later_incomplete_target_with_terminal_marker_waits_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut partial = seeded_source_snapshot();
+    if let Observation::Present { value: group, .. } = &mut partial.availability_group {
+        let database = group.databases.first_mut().unwrap();
+        database
+            .replicas
+            .retain(|replica| replica.replica_id != guid(THIRD_ID));
+        group
+            .automatic_seeding
+            .retain(|seed| seed.remote_replica_id != guid(THIRD_ID));
+    }
+    let associated = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ControlledSeedSource {
+                config: observer_config_for_timeout(0, 100),
+                associated: associated.clone(),
+                associated_snapshot: partial,
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            root.path().to_owned(),
+        )
+        .unwrap(),
+    );
+    admit_seed_replicator(&replicator).await;
+    associated.store(true, Ordering::SeqCst);
+    let message = application_error(
+        replicator
+            .build_replica(target_build(2, "later-incomplete-target"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("bounded callback budget"), "{message}");
+    assert!(executor.effects.lock().unwrap().is_empty());
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn intent_only_restart_replays_or_atomically_replaces_the_abandoned_owner() {
+    for (target_index, build_id) in [
+        (1, "intent-winner"),
+        (1, "superseding-intent-winner"),
+        (2, "replacement-target-winner"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let store = SeedDispatchStore::open(root.path()).unwrap();
+            store
+                .create(&exact_seed_record(1, "intent-winner"))
+                .unwrap();
+        }
+        let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+        admit_seed_replicator(&replicator).await;
+        replicator
+            .build_replica(target_build(target_index, build_id))
+            .await
+            .unwrap();
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+        assert!(!root.path().join("seed-dispatch-v1.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn retained_dispatch_accepts_fresh_source_and_target_sessions_but_rejects_stale_callback() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        let store = SeedDispatchStore::open(root.path()).unwrap();
+        let record = exact_seed_record_with_sessions(1, "historical-build", "historical-session");
+        store.create(&record).unwrap();
+        let mut ambiguous = record.clone();
+        ambiguous.mark_submitting().unwrap();
+        let mut ambiguous = store.replace(record.revision(), ambiguous).unwrap();
+        ambiguous.mark_ambiguous().unwrap();
+        store.replace(ambiguous.revision(), ambiguous).unwrap();
+    }
+
+    let complete = Arc::new(AtomicBool::new(true));
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+
+    let stale = target_build_with_sessions(1, "historical-build", "historical-session");
+    let message = application_error(replacement.build_replica(stale).await.unwrap_err());
+    assert!(message.contains("session"), "{message}");
+    assert!(root.path().join("seed-dispatch-v1.json").exists());
+
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "replacement-build",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn build_rejects_changed_sql_incarnation_and_conflicting_source_association() {
+    let mut changed_incarnation = bootstrap_membership_snapshot(0);
+    changed_incarnation.instance.sqlserver_start_time = "2026-10-09T00:00:00".into();
+    let mut conflicting_association = seeded_source_snapshot();
+    if let Observation::Present { value: group, .. } =
+        &mut conflicting_association.availability_group
+    {
+        group.databases[0]
+            .local
+            .as_mut()
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap()
+            .family_guid = Some(guid(AG_ID));
+    }
+
+    for (name, sample, expected) in [
+        ("SQL incarnation", changed_incarnation, "incarnation"),
+        (
+            "source association",
+            conflicting_association,
+            "source database association",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = Arc::new(ScriptedMutationExecutor {
+            databases: Mutex::new(
+                vec![
+                    Ok(Some(owned_standalone_database())),
+                    Ok(Some(owned_standalone_database())),
+                ]
+                .into(),
+            ),
+            effects: Mutex::new(Vec::new()),
+            executions: Mutex::new(VecDeque::new()),
+        });
+        let replicator = Arc::new(
+            SqlServerReplicator::new_bootstrap_with_topology(
+                SqlServerServiceConfig::new(
+                    ResourceUid::new("resource-a"),
+                    "replica-1.example:5022",
+                )
+                .unwrap(),
+                Arc::new(ScriptedSource {
+                    config: observer_config(),
+                    samples: Mutex::new(
+                        vec![
+                            Ok(present(bootstrap_membership_snapshot(0))),
+                            Ok(present(bootstrap_membership_snapshot(0))),
+                            Ok(present(sample)),
+                        ]
+                        .into(),
+                    ),
+                }),
+                Arc::new(ScriptedClock {
+                    times: Mutex::new(vec![OBSERVED_AT].into()),
+                }),
+                kuberic_identity(1),
+                topology_expectation(),
+                SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+                executor.clone(),
+                root.path().to_owned(),
+            )
+            .unwrap(),
+        );
+        admit_seed_replicator(&replicator).await;
+        let message = application_error(
+            replicator
+                .build_replica(target_build(1, "conflicting-build"))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains(expected), "{name}: {message}");
+        assert!(executor.effects.lock().unwrap().is_empty(), "{name}");
+    }
 }
 
 #[tokio::test]

@@ -83,13 +83,37 @@ test-live-three-replica-recovery root="target/mssql-three-replica-recovery":
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
         three_replica_sig -- --ignored --test-threads=1 --nocapture
 
-# Exercise post-AG, post-agent panic, and report fault checkpoints with exact recovery.
+# Lose callback replies after each classified SQL step and exercise seed/callback seams.
 test-live-three-replica-faults root="target/mssql-three-replica-faults":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_post_ag_and_report_fault_checkpoints_recover -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_mssql_bootstrap_fault_boundaries -- --ignored --exact --test-threads=1 --nocapture
+
+# Exercise isolated SQL-native cases and callback observation-seam conflicts sequentially.
+test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_conflict_evidence -- --ignored --exact --test-threads=1 --nocapture
+
+# Reject post-compaction association removal and AG recreation without redispatch.
+test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-seed":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture
+
+# Revalidate target-local lineage and SQL process incarnation at every build window.
+test-live-three-replica-target-evidence root="target/mssql-three-replica-target-evidence":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_target_host_evidence_faults -- --ignored --exact --test-threads=1 --nocapture
 
 # Recover and remove only the exactly journaled real three-member topology.
 cleanup-live-three-replica root="target/mssql-three-replica":

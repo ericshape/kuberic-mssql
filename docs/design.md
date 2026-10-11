@@ -1,8 +1,10 @@
 # SQL Server External-Replication Adapter
 
-> **Status:** Safety contract and observe-only runtime. Read-only TDS queries
-> are supported; SQL Server process management, topology mutations, and
-> failover effects are not enabled.
+> **Status:** Safety contract, observe-only production runtime, and explicit
+> licensed-test bootstrap convergence. Read-only TDS queries are supported;
+> bootstrap-capable test hosts can create the managed database/AG, join
+> secondaries and seed once. SQL Server process management and failover effects
+> are not enabled.
 >
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
@@ -64,8 +66,9 @@ the initial profile.
 
 ## Current Implementation
 
-This repository implements the safety contract and a standalone observe-only
-runtime:
+This repository implements the safety contract, a standalone observe-only
+runtime, and an explicit bootstrap-capable host construction used by licensed
+validation:
 
 - validation of the supported SQL Server profile;
 - immutable container/native-package artifacts and Kubernetes Secret references;
@@ -83,17 +86,26 @@ runtime:
 - duplicate-operation and operation-ID-reuse classification;
 - verified-TLS TDS execution with mounted observation credentials;
 - capability-checked, identity-bracketed native DMV snapshots; and
-- a freshness-aware monitor and observe-only JSON CLI.
+- a freshness-aware monitor and observe-only JSON CLI;
+- closed source-database, AG-create, local-join and database-add effects derived
+  from validated callback/operation data;
+- operation-specific absent, incomplete, complete, conflicting and unsafe
+  native classifiers; and
+- a source-database-owned AG handshake that retains resource/configuration/name
+  intent before creation and then freezes SQL Server's generated AG GUID; and
+- bounded seed-dispatch evidence for the pre-association ambiguity only.
 
 The production crate connects to already provisioned SQL Server instances. It
 does not create an AG, seed a database, renew a write lease, change a native
-role, or integrate with either Kuberic operator. The optional Kuberic runtime
-adapter validates role, progress, and one exactly bound current-configuration
-callback without mutating SQL Server. A bound healthy topology may also report
-`catch_up_capability` equal to freshly validated current configuration progress;
-it does not claim earlier retained history, database catch-up, build, recovery,
-lease, or failover capability. Mutation configuration is therefore only a
-contract for later stages, not an enabled execution path.
+role, or integrate with either Kuberic operator through its ordinary
+configuration. The optional Kuberic runtime adapter remains observe-only unless
+an explicit bootstrap capability and closed mutation executor are injected by
+the licensed test harness. That construction lets the configured primary own
+source database and AG convergence, each secondary own only its local join, and
+Kuberic build authority own one group-level `ADD DATABASE` dispatch. A bound
+healthy topology reports `catch_up_capability` equal to freshly validated
+current configuration progress; it does not claim earlier retained history,
+general repair, destructive recovery, lease, or failover capability.
 
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
@@ -107,16 +119,16 @@ production launchers.
 The licensed one-replica fixture owns one container, TLS assets and test
 principals solely to validate absence, permission denial, TLS rejection and CLI
 output. It creates no AG, endpoint or database. The licensed three-replica
-fixture creates certificate-authenticated endpoints, joins an external AG,
-grants automatic-seeding database creation, seeds one database, and writes a
-proof marker. These effects exist solely in isolated test infrastructure.
-Production `SqlExecutor`, `TdsExecutor`, observer, service, and replicator paths
-receive no administrative SQL or container authority.
+fixture owns containers, HADR enablement, certificate-authenticated endpoints,
+peer authentication, credentials and cleanup. Explicit bootstrap-capable hosts
+create the source database and AG, join local secondaries and seed the database
+through Kuberic build authority. Ordinary production construction receives no
+administrative SQL or container authority.
 
 The crate remained independent when the classic runtime was removed. The
 `sqlserver-observer` binary
 and runtime remain independently testable without the replication runtime.
-See the [observe-only runtime guide](observation.md) for configuration,
+See the [observe-only runtime guide](../README.md#configuration) for configuration,
 permissions, output semantics, and tests.
 
 Two capabilities named in this design are defined but not yet enforceable, and
@@ -124,11 +136,16 @@ each is assigned to a later stage rather than half-built now:
 
 - **Encoding and decoding.** The canonical writer produces the bytes that the
   input signature covers, but there is no operation-envelope reader or `serde`
-  support, so an envelope cannot yet be persisted or sent between processes.
-  Stage 3 owns the decoder together with the durable result journal that needs
-  it. Observation JSON serialization does not change the operation contract.
-  `OperationRequest::from_decoded_parts` exists as the seam that decoder will
-  use, and is the only path on which the contract-version check is reachable.
+  support, so an envelope cannot yet be sent between processes. Stage 3 did not
+  select operation envelopes for its callback boundary, so no decoder was
+  added.
+  Decoding does not by itself require a separate application result journal:
+  each operation must first be mapped to Kuberic's durable command/effect
+  receipts and an exact native SQL postcondition. Application-owned persistence
+  is added only for a crash or replay ambiguity that those two sources cannot
+  reconstruct safely. `OperationRequest::from_decoded_parts` exists as the seam
+  that the decoder will use, and is the only path on which the contract-version
+  check is reachable.
 - **Proof validity and issuance.** `DestructiveApproval` and `FenceReference`
   currently bind a receipt to an exact operation ID and canonical input
   signature. They carry no issue or expiry time and no issuer verification, so
@@ -304,12 +321,19 @@ storage and explicit rotation procedures. Availability Groups do not replicate
 server logins or other server-level objects, so those need separate
 provisioning.
 
+Stage 3 does not add certificate provisioning, rotation, or a new production
+mutation transport. Its executor remains behind an internal boundary and live
+validation may reuse the licensed fixture's existing administrative connection.
+This deferral does not authorize a plaintext production bypass; production
+mutation credentials and transport provisioning remain part of controller and
+operations integration.
+
 ## Level-Triggered Integration Boundary
 
 youyuanwu/kuberic#79 supplied the durable level-triggered runtime and controller
-boundary. This repository now consumes the published runtime for an observe-only
-progress vertical slice. Controller deployment and authority-changing SQL
-operations still require:
+boundary. This repository now consumes the published runtime for observation
+and an explicitly constructed bootstrap/build vertical slice. Controller
+deployment and general authority-changing SQL operations still require:
 
 - durable replica and incarnation evidence;
 - versioned declarative commands and retained terminal results;
@@ -327,22 +351,99 @@ numbers to SQL Server names and AG endpoint URLs. The current-configuration
 callback supplies dynamic full identities, roles, sessions and addresses.
 Fresh SQL evidence freezes native replica GUIDs, AG/database lineage and the
 local SQL process start. Bootstrap callbacks may omit remote transport
-descriptions; those fields permit only one-way completion, followed by exact
-replay.
+descriptions. Complete values freeze the binding. Later callbacks may omit
+remote session or address projections, but cannot clear the frozen values; any
+supplied value must still match exactly.
 
-The application persists only a schema-versioned non-secret digest binding
-under its authorized application root. Kuberic's private authority store
-remains behind the public host boundary. `catch_up_capability` is available
-after native current admission and role publication; callbacks continue to
-reobserve SQL Server. Previous/current transitions, catch-up quorum, build,
-removal, data loss, recovery, failover and lease behavior remain explicit
-observe-only errors.
+The application persists a schema-versioned non-secret runtime binding and,
+only while native SQL cannot prove whether group seeding was dispatched, one
+bounded `seed-dispatch-v1.json` record under the same authorized application
+root. Kuberic's private authority store remains behind the public host boundary.
+The already-owned source database separately retains narrow SQL extended
+properties for AG creation intent and the exact SQL-generated AG GUID. It also
+retains one singleton `dbo.kuberic_seed_dispatch` row containing a derived
+64-character operation token, the exact AG/database identities, and the native
+submission phase. This is bounded operation metadata, not a general command or
+result ledger. After SQL accepts the group dispatch, one scope-named
+`master` extended property retains `v1:<operation-token>` as the terminal
+group marker. The token binds resource/configuration identity, AG name and
+GUID, source database identity and lineage, source SQL incarnation, and both
+authorized target identities.
+
+The primary's remote DMV rows are dispatch-progress evidence only. Completing a
+target build requires a challenge-bound report produced by a fresh direct
+observation on that target host. The explicit test-host exchange authenticates
+the exact resource, accepted configuration, build ID, target Kuberic identity
+and current process session. The callback then validates the target native
+replica GUID, exact AG and group-database identities, family/recovery-fork
+lineage, local synchronized/healthy/online/not-suspended state, and the target
+SQL start identity frozen by the licensed fixture. A report created for an old
+challenge, build or process session is not reusable. This exchange exists only
+in reviewed bootstrap-testing construction and does not alter the pinned
+Kuberic protocol or ordinary read-only runtime.
+
+The file record binds exact authority and native identities and distinguishes
+`Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
+`FailedRetryable`. `Submitting` alone never suppresses another attempt after a
+restart. The SQL batch takes a group-scope session application lock, publishes
+`submitting` before `ALTER AVAILABILITY GROUP ... ADD DATABASE`, and writes
+the terminal marker plus `accepted`, or `failed_retryable`, before releasing
+that lock. Recovery can acquire the same lock to prove the old submitting
+session is gone: exact native association or an accepted row can establish the
+terminal marker without redispatch, a held lock is ambiguous, and an absent
+effect after lock acquisition is definitely retryable.
+
+Schema-v1 file records migrate fail closed. Old `Dispatched` becomes the
+dedicated, tokenless `LegacyAmbiguous` phase because schema v1 had no SQL-owned
+row, application-lock handshake, or terminal marker. It can compact only when
+the record's exact native source association already exists; compaction records
+the exact group-database identity and retains the tokenless legacy tombstone so
+later restarts remain fenced. Missing or incomplete association requires
+explicit operator recovery and can never become `FailedRetryable`, a new
+`Intent`, or another submission.
+
+Current configuration replay, secondary join, and seed build require native
+markers to match the resource, accepted configuration, AG name, and observed
+GUID; an unmarked same-name AG or a same-name replacement with another GUID is
+a terminal conflict rather than an adoption candidate. The temporary file
+record is removed as soon as exact source database-to-AG association proves the
+terminal marker and accepted operation. Healthy later builds replay from the
+terminal marker and exact native state only. Once terminal, absent or incomplete
+source association, source database identity/lineage replacement, or AG GUID
+replacement is conflicting or unsafe and cannot create another intent or issue
+another `ADD DATABASE`. Previous/current
+transitions, catch-up quorum, removal, data loss, destructive recovery, failover
+and lease behavior remain explicit unsupported errors.
 
 Role is not write authority. The healthy reports expose one primary and two
 active secondaries, but write access is never granted. No client SQL service
 address is published and there is no external write lease. The fixture's marker
 write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
+
+Stage 3 first identifies what Kuberic's private agent store retains and what
+exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
+v2 precedent uses three distinct owners: Kuberic agent SQLite metadata,
+application-owned checksummed metadata, and PGDATA. MSSQL applies the same
+ownership discipline with Kuberic authority, native SQL state, the immutable
+runtime binding, the AG identity marker in the owned source database, and one
+bounded seed-dispatch file under the existing application root plus one
+singleton SQL-owned dispatch row. The file is temporary ambiguity state; one
+bounded terminal extended property remains in `master` after compaction so
+loss or recreation of the source database or AG cannot reopen dispatch. The AG
+marker only binds creation ownership and native identity. No general second
+operation database or result ledger was added.
+
+Bootstrap SQL is level-triggered at statement granularity. Scoped native DDL
+triggers persist the exact resource/configuration-derived creation intent before
+`CREATE DATABASE` and `CREATE AVAILABILITY GROUP`; only the corresponding
+token-bearing typed statement can atomically write the generated creation
+receipt. Recovery mode, ownership, marker schema, full backup, log backup,
+backup verification, AG binding, local join, seeding grant, and a narrow
+SQL-owned grant-completion marker then converge as separate classified steps.
+Read-only `msdb` history proves the full/log/VERIFY chain, while the local
+marker joined to the current AG GUID proves completion of `GRANT CREATE ANY
+DATABASE`; retries issue only the next missing safe statement.
 
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
 exact revision used by each build. The current pin
@@ -360,13 +461,18 @@ bound-listener handoff from
 2. **Runtime and observation** — implemented: a replaceable TDS executor,
    immutable DMV snapshots, freshness, startup capability checks, an
    observe-only CLI, and Kuberic configuration-progress publication.
-3. **Bootstrap, join, and reseed** — pure convergence decisions, one native
-   effect at a time, durable SQL-specific result journal, and automatic-seeding
-   postconditions.
-4. **Switchover, failover, and fencing** — external lease handling, sequence
-   arbitration, verified fence receipts, explicit data-loss recovery, and live
-   fault tests. Automatic failover remains disabled until every safety gate
-   passes.
+3. **Bootstrap, join, and seed convergence** — implemented for explicit
+   bootstrap-capable hosts: deterministic statement-level
+   database/backup/AG/join/grant convergence, one build-authorized group seed
+   dispatch, gap-driven seed metadata, exact native postconditions,
+   restart/cancellation/retry/lost-reply recovery, isolated licensed SQL-native
+   cases, and test-only callback observation-seam validation. This stage adds
+   neither certificate provisioning nor a production mutation transport.
+4. **Fencing, reseed, switchover, and failover** — establish verified target and
+   old-primary fencing before destructive reseed or role movement, then add
+   external lease handling, sequence arbitration, authenticated fence and
+   approval receipts, explicit data-loss recovery, and live fault tests.
+   Automatic failover remains disabled until every safety gate passes.
 5. **Controller integration** — Pod/PVC/Secret/Service convergence through the
    implemented Kuberic command/evidence boundary.
 6. **Kubernetes E2E and operations** — pinned licensed test environment,
@@ -398,9 +504,10 @@ availability group and never adopts or borrows an existing container.
 The Rust three-replica lifecycle pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
 and automatically accepts the EULA only through the test crate's sourceless
-authorization constructor. It creates three resource-bounded instances, real
-endpoints, one synchronous external AG and one automatically seeded database.
-Fresh direct observations must prove one primary, two synchronized healthy
+authorization constructor. It creates three resource-bounded instances and real
+endpoints; explicit bootstrap-capable hosts create one synchronous external AG
+and one automatically seeded database. Fresh direct observations must prove one
+primary, two synchronized healthy
 secondaries, common identities and lineage, completed seeding, and a marker
 readable from all members. Three in-process Kuberic agents then admit only the
 frozen current topology and publish bracketed, fenced reports. Exact ownership
@@ -413,9 +520,11 @@ replacement processes receive fresh sessions, stale-session commands are
 rejected, exact reports reconverge, and native marker continuity is retained.
 Fault, signal and recovery cases remain explicitly invoked, including failure
 after replacement-host startup followed by exact cleanup and retry. This does
-not advance the production delivery sequence: it does not test SQL Server
-process restart, write-lease expiry, old-primary fencing, switchover, failover,
-replica replacement, Kubernetes lifecycle, or client routing.
+not advance the production delivery sequence: licensed validation restarts a
+target SQL process only to prove build-evidence invalidation; it does not own or
+contain that process lifecycle. Write-lease expiry, old-primary fencing,
+switchover, failover, replica replacement, Kubernetes lifecycle, and client
+routing remain unimplemented.
 
 ## References
 

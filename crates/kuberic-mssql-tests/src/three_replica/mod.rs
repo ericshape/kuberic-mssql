@@ -18,7 +18,8 @@ pub use admin::{
 };
 pub use availability_group::{
     AvailabilityGroupError, EndpointEvidence, HADR_ENDPOINT_NAME, HADR_ENDPOINT_PORT,
-    ProvisionedAvailabilityGroup, validate_binding_incarnations, validate_endpoint_evidence,
+    PreparedAvailabilityGroup, ProvisionedAvailabilityGroup, validate_binding_incarnations,
+    validate_endpoint_evidence,
 };
 pub use cleanup::{
     CLEANUP_BUDGET, CancellationSignals, CleanupBackend, CleanupClock, CleanupCompletion,
@@ -50,9 +51,9 @@ pub use member::{
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,
     JournalError, KubericMember, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
-    NativeTopologyIntent, OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceKind,
-    ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation,
-    TopologyRun,
+    NativeTopologyIntent, NativeTopologyPhase, OwnershipJournal, ProcessIncarnation,
+    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
+    SqlMember, SqlMemberIncarnation, TopologyRun,
 };
 pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalDocument,
@@ -74,6 +75,9 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
-pub use public_kuberic_group::{PublicMssqlGroup, PublicMssqlPod};
+pub use public_kuberic_group::{
+    LicensedConflictScenario, PublicBuildCommand, PublicFaultInjection, PublicMssqlGroup,
+    PublicMssqlPod, PublicMutationFault,
+};
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;

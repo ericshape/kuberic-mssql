@@ -372,6 +372,9 @@ fn native_binding_rejects_sql_restart_after_member_readiness() {
         sql_start_time: format!("2027-01-15T08:00:0{index}"),
         sql_start_unix_millis: 1_800_000_000_000 + index as i64,
         observer_config: PathBuf::from(format!("/fixture/member-{}/observer.json", index + 1)),
+        admin_username: PathBuf::from("/fixture/credentials/admin-username"),
+        admin_password: PathBuf::from("/fixture/credentials/admin-password"),
+        ca_certificate: PathBuf::from("/fixture/tls/ca-certificate.pem"),
     });
     let frozen: [SqlMemberIncarnation; 3] = std::array::from_fn(|index| SqlMemberIncarnation {
         ordinal: launched[index].ordinal,
@@ -704,6 +707,31 @@ fn native_evidence_accepts_only_fresh_exact_healthy_three_member_topology() {
     .unwrap();
     assert_eq!(validated.primary_ordinal, 1);
     assert_eq!(validated.seeding_operation_ids.len(), 2);
+}
+
+#[test]
+fn native_evidence_accepts_historical_failure_after_exact_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = healthy_native_evidence();
+    evidence[0].automatic_seeding.push(SeedingEvidence {
+        group_database_id: guid(20),
+        remote_replica_id: guid(2),
+        operation_id: guid(99),
+        is_source: true,
+        current_state: Some("FAILED".to_owned()),
+        performed_seeding: Some(false),
+        failure_state: Some(106),
+        error_code: Some(35250),
+        completion_time: Some("2026-10-06T22:59:59".to_owned()),
+    });
+
+    validate_native_evidence(
+        &native_run(directory.path()),
+        evidence,
+        10_001,
+        Duration::from_secs(30),
+    )
+    .unwrap();
 }
 
 #[test]

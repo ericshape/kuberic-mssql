@@ -5,6 +5,13 @@ Linux x86-64 instance and reports native HA evidence. It does not deploy a
 container, accept an EULA, start or restart `sqlservr`, create an AG, change a
 role, renew a write lease, or execute any mutation command.
 
+An explicit bootstrap-capable construction exists for licensed validation. The
+Rust fixture supplies three running SQL Server instances, HADR endpoints,
+authentication and administrative credentials; the three standalone
+`ReplicaHost` applications then create the managed database and AG, join local
+secondaries and perform one build-authorized automatic-seeding dispatch. This
+path is not exposed by the production CLI or runtime configuration.
+
 The library is compatible with the observation side of the level-triggered
 contract. Its optional Kuberic runtime publishes validated AG configuration
 sequence through the fixed Service Fabric-compatible progress API and hosts the
@@ -280,10 +287,33 @@ application binding, public `ReplicaHost` assembly, startup cancellation and
 shutdown/error composition. Kuberic's private SQLite store and runtime-effect
 types are not part of the application API.
 
-Operation-envelope serialization/decoding and the durable result journal
-remain stage 3 work. The existing canonical signatures and approval/fence
-bindings are unchanged. Observation JSON is an output format, not a new
-authenticated command protocol.
+Stage 3 did not select operation-envelope serialization or a generic result
+journal. Callback-visible authority and Kuberic's retained command/build
+evidence are reconciled with exact native SQL postconditions; only the bounded
+pre-association seed-dispatch ambiguity uses application metadata. Its durable
+file phases distinguish intent, submitting, accepted/ambiguous, and definite
+retryable failure. A matching singleton SQL-owned token row and group-scoped
+application lock prove acceptance, active ambiguity, or a safe pre-effect
+retry; a local `Submitting` phase never claims that SQL accepted the request.
+Before temporary file compaction, SQL also retains one scope-named terminal
+extended property in `master`. Its exact token binds the resource,
+configuration, AG GUID, source database identity/lineage, SQL incarnation and
+authorized targets. Once present, later association loss or database/AG
+recreation is terminal conflict/unsafe and can never trigger another
+`ADD DATABASE`.
+Build completion additionally requires a challenge-bound report made from a
+fresh direct observation on the target host. The test-host exchange admits only
+the exact current Kuberic resource, configuration, build, target identity and
+process session, and the primary callback revalidates the target native replica,
+AG/database identities, family/recovery-fork lineage, synchronized/healthy/
+online/not-suspended state, and the fixture-frozen target SQL start identity.
+Primary-side remote DMV rows may advance dispatch polling, but cannot complete
+a target build. The exchange is available only to explicit bootstrap testing
+construction; it adds no production controller or mutation transport.
+The existing
+canonical signatures and approval/fence bindings remain contracts for later
+command transport. Observation JSON is output, not an authenticated command
+protocol.
 
 ## Testing
 
@@ -360,10 +390,16 @@ untouched.
 ### Three-replica licensed happy path
 
 The dedicated three-replica fixture complements the one-replica observer/CLI
-path above. It starts three real SQL Server processes, creates
-certificate-authenticated endpoints, joins one external AG, automatically
-seeds one database, runs three public `ReplicaHost` applications through agent
-control RPCs, and proves a marker is readable from every member.
+path above. It starts three real SQL Server processes and creates
+certificate-authenticated endpoints and peer authentication. Explicit
+bootstrap-capable public `ReplicaHost` applications then create one managed
+database and external AG, join both secondaries, perform one group-level
+automatic-seeding dispatch through Kuberic build authority, and prove a marker
+is readable from every member. Database create, full recovery, ownership,
+marker schema, full/log backup readiness, backup verification, AG intent,
+create, GUID binding, local join, seeding grant, and its SQL-owned completion
+marker are independently observed typed steps; a retry executes only the next
+missing safe step.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
 direct Cargo test runs. The happy path runs after one-replica validation in
@@ -436,16 +472,40 @@ just test-live-three-replica-signal
 just test-live-three-replica-signal target/my-mssql-three-replica-signal
 just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
 just test-live-three-replica-faults target/my-mssql-three-replica-faults
+just test-live-three-replica-conflicts target/my-mssql-three-replica-conflicts
+just test-live-three-replica-terminal-seed target/my-mssql-three-replica-terminal-seed
+just test-live-three-replica-target-evidence target/my-mssql-three-replica-target-evidence
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
-executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
-post-AG failure, an actual panic after agent startup, a report-stage failure,
-and a failure after same-root replacement startup; each is followed by a
-separate exact cleanup process and a final same-root restart retry.
+executes real SIGINT and SIGKILL subprocess cases.
+
+The fault recipe uses a test-only observation seam to lose the callback reply
+after each separately classified database, backup, AG-create/bind, local-join,
+and seeding-permission SQL step. The statements themselves execute through the
+normal TDS mutation path, and replacement hosts then reobserve their native
+results. Seed intent, submission, acceptance, association, native completion,
+and callback publication use explicit test-only gates/probes around real
+callbacks; they are not SQL Server process-crash tests.
+
+The conflict recipe separates three real SQL-native cases from callback-seam
+coverage. Through normal TDS observation it converges a source that inherits
+`SIMPLE` recovery, refuses an unowned same-name database, and refuses an
+unowned exact-profile same-name AG. The remaining AG, replica, endpoint,
+database-identity/recovery, and lineage cases inject decoded observations into
+the real production validators; the SQL-incarnation validator uses a real
+process restart plus a test gate.
+
+The terminal-seed recipe performs real SQL association removal and AG
+recreation, then proves terminal conflict/unsafe classification, zero
+redispatch, no recreated temporary intent, and exact cleanup. The
+target-evidence recipe uses real target SQL process restarts and test-injected
+target-local lineage mismatches at the pre-association, in-flight-seeding, and
+post-native/pre-reply windows. Every scenario performs exact, idempotent
+cleanup.
 
 Direct test commands remain available:
 
@@ -461,7 +521,8 @@ cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
 An explicitly requested live test fails if any of its prerequisites are
 missing; it never silently skips. The one-replica fixture uses observation
 principals and creates no AG, endpoint or database. The three-replica fixture
-performs test-only endpoint, AG, database, seeding, and marker mutation. Both
-lifecycles own and clean their exact resources; production remains observe-only.
-Local three-node failover, lease expiry, old-primary fencing, and fault
-injection remain unsupported and are not claims of this work.
+owns test-only containers, endpoint security, credentials and cleanup; explicit
+bootstrap-capable hosts own the database, AG, joins and seeding effects. Both
+lifecycles clean their exact resources, and ordinary production construction
+remains observe-only. Local three-node failover, lease expiry and old-primary
+fencing remain unsupported and are not claims of this work.
