@@ -14,6 +14,10 @@ ROOT = Path(__file__).resolve().parents[3]
 RESULTS = ROOT / "target/full-validation-results"
 FIXTURES = ROOT / "target/full-validation-fixtures"
 RESULTS.mkdir(parents=True, exist_ok=True)
+FIXTURES.mkdir(mode=0o700, parents=True, exist_ok=True)
+if FIXTURES.is_symlink() or FIXTURES.stat().st_uid != os.geteuid():
+    raise RuntimeError("fixture parent must be a real directory owned by the runner")
+FIXTURES.chmod(0o700)
 ENV = {
     **os.environ,
     "PATH": f"{Path.home()}/.local/bin:{Path.home()}/.cargo/bin:{os.environ['PATH']}",
