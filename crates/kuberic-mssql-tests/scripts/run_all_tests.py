@@ -33,6 +33,8 @@ REPORT = {
     "platform": sys.platform,
     "started_at_unix": time.time(),
     "results": [],
+    "prior_run_cases": [],
+    "resume_after": os.environ.get("FULL_VALIDATION_RESUME_AFTER", ""),
 }
 
 
@@ -64,6 +66,19 @@ def execute(name, command, environment=None):
     return result
 
 
+def verify_no_fixture_resources(name):
+    for kind in ["container", "network", "volume"]:
+        result = execute(
+            f"verify-{name}-{kind}",
+            ["docker", kind, "ls", "-q", "--filter", "label=io.kuberic.mssql.fixture"]
+            + (["--all"] if kind == "container" else []),
+        )
+        if result.returncode or result.stdout.strip():
+            REPORT["results"][-1]["success"] = False
+            save()
+            raise RuntimeError(f"owned {kind} resources remain; refusing further fixtures")
+
+
 def main():
     if sys.platform != "linux" or os.geteuid() == 0:
         raise RuntimeError("full validation requires a non-root Linux runner")
@@ -82,6 +97,8 @@ def main():
         if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
             executables[artifact["target"]["name"]] = artifact["executable"]
 
+    resume = REPORT["resume_after"]
+    reached_resume = not resume
     for target in ["live_one_replica", "live_three_replica", "three_replica_lifecycle"]:
         executable = executables[target]
         listed = subprocess.check_output(
@@ -93,6 +110,12 @@ def main():
             if capability.returncode:
                 raise RuntimeError("cannot validate ACL deletion without the requested capability")
         for index, name in enumerate(names):
+            if not reached_resume:
+                REPORT["prior_run_cases"].append(name)
+                if name == resume:
+                    reached_resume = True
+                save()
+                continue
             fixture = FIXTURES / f"{target}-{index}"
             environment = {
                 **ENV,
@@ -103,12 +126,32 @@ def main():
                                         "--nocapture", "--test-threads=1"], environment)
             if target != "three_replica_lifecycle":
                 family = "one" if target == "live_one_replica" else "three"
-                cleanup = execute(
-                    f"cleanup-{target}-{index}",
-                    [executables[f"mssql-{family}-replica-fixture"], "cleanup", "--root", str(fixture)],
-                )
-                if cleanup.returncode:
-                    raise RuntimeError("owned cleanup failed; refusing to launch further SQL fixtures")
+                cleanup_roots = []
+                if fixture.exists():
+                    for directory, children, files in os.walk(fixture, followlinks=False):
+                        children[:] = [
+                            child for child in children
+                            if not (Path(directory) / child).is_symlink()
+                        ]
+                        if "ownership.json" in files:
+                            journal = Path(directory) / "ownership.json"
+                            if journal.is_symlink():
+                                raise RuntimeError("refusing symlinked ownership journal")
+                            cleanup_roots.append(Path(directory))
+                if not cleanup_roots and not fixture.exists():
+                    cleanup_roots.append(fixture)
+                for ordinal, owned_root in enumerate(sorted(cleanup_roots)):
+                    cleanup = execute(
+                        f"cleanup-{target}-{index}-{ordinal}",
+                        [executables[f"mssql-{family}-replica-fixture"], "cleanup", "--root",
+                         str(owned_root)],
+                    )
+                    if cleanup.returncode:
+                        raise RuntimeError("owned cleanup failed; refusing further SQL fixtures")
+                verify_no_fixture_resources(f"{target}-{index}")
+
+    if not reached_resume:
+        raise RuntimeError(f"resume test was not in the live inventory: {resume}")
 
     execute("live-ag-convergence", [
         executables["mssql-ag-convergence-fixture"],
@@ -118,6 +161,7 @@ def main():
         executables["mssql-three-replica-fixture"], "cleanup", "--root",
         str(FIXTURES / "ag-convergence"),
     ])
+    verify_no_fixture_resources("ag-convergence")
     REPORT["finished_at_unix"] = time.time()
     save()
     return 0 if all(result["success"] for result in REPORT["results"]) else 1

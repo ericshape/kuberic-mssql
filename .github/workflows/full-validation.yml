@@ -2,14 +2,11 @@ name: Full SQL Server validation
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - dev/sqlserver-ag-convergence
-    paths:
-      - .github/workflows/full-validation.yml
-      - crates/**
-      - Cargo.toml
-      - Cargo.lock
+    inputs:
+      resume_after:
+        description: "Previously completed live test; earlier cases are reported as prior-run results"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -46,6 +43,7 @@ jobs:
         id: validation
         env:
           CARGO_BUILD_JOBS: "1"
+          FULL_VALIDATION_RESUME_AFTER: ${{ inputs.resume_after }}
         run: python3 crates/kuberic-mssql-tests/scripts/run_all_tests.py
       - name: Preserve sanitized results
         if: always() && steps.setup.outcome == 'success'
