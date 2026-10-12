@@ -317,6 +317,14 @@ passing.
 
 ### Opt-in laboratory test
 
+On a qualified Linux x86-64 runner, `just test-all` includes this lab along with
+all existing one- and three-member live targets. The test-only
+`mssql-ag-convergence-fixture` binary uses the existing Rust-owned member
+launcher and endpoint preparation, provisions only the primary database and
+backup chain, then invokes the unchanged adapter-driven test. It never
+pre-creates or joins the AG or grants seeding permissions. Its fixture and
+private lab/journal directory are cleaned up after success or failure.
+
 `live_ag_convergence` drives bootstrap, join, seeding and retained-result replay on
 an existing disposable three-instance fixture. Its test-only authorizer accepts
 only non-destructive commands for the explicit resource. It cannot authorize

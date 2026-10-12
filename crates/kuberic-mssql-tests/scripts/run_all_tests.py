@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Run every test target and opt-in case, retaining outcomes without fail-fast."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parents[3]
+RESULTS = ROOT / "target/full-validation-results"
+FIXTURES = ROOT / "target/full-validation-fixtures"
+RESULTS.mkdir(parents=True, exist_ok=True)
+ENV = {
+    **os.environ,
+    "PATH": f"{Path.home()}/.local/bin:{Path.home()}/.cargo/bin:{os.environ['PATH']}",
+    "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "1"),
+}
+for name in [
+    "SQLSERVER_TEST_EULA_ACCEPTED", "KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER",
+    "KUBERIC_MSSQL_SEED_FAULT_FILTER", "KUBERIC_MSSQL_CONFLICT_FILTER",
+]:
+    ENV.pop(name, None)
+REPORT = {
+    "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    "platform": sys.platform,
+    "started_at_unix": time.time(),
+    "results": [],
+}
+
+
+def save():
+    (RESULTS / "summary.json").write_text(json.dumps(REPORT, indent=2) + "\n")
+
+
+def execute(name, command, environment=None):
+    print(f"=== {name} ===", flush=True)
+    result = subprocess.run(command, cwd=ROOT, env=environment or ENV, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+    (RESULTS / f"{name}.txt").write_text(output)
+    skipped = "SKIPPED:" in output
+    summaries = [
+        {"passed": int(passed), "failed": int(failed), "ignored": int(ignored)}
+        for passed, failed, ignored in re.findall(
+            r"test result: .*?\. (\d+) passed; (\d+) failed; (\d+) ignored;", output
+        )
+    ]
+    REPORT["results"].append({
+        "name": name, "command": command, "exit_code": result.returncode,
+        "success": result.returncode == 0 and not skipped,
+        "self_reported_skip": skipped, "test_summaries": summaries,
+    })
+    save()
+    if result.returncode or skipped:
+        print(output[-8000:], flush=True)
+    print(f"exit={result.returncode}, self_reported_skip={skipped}", flush=True)
+    return result
+
+
+def main():
+    if sys.platform != "linux" or os.geteuid() == 0:
+        raise RuntimeError("full validation requires a non-root Linux runner")
+    execute("format", ["cargo", "fmt", "--all", "--", "--check"])
+    execute("clippy", ["cargo", "clippy", "--locked", "--workspace", "--all-targets",
+                       "--all-features", "--", "-D", "warnings"])
+    execute("server-free", ["cargo", "test", "--locked", "--workspace", "--all-features",
+                            "--no-fail-fast", "--", "--test-threads=1"])
+    build = execute("build-tests", ["cargo", "test", "--locked", "-p", "kuberic-mssql-tests",
+                                    "--all-features", "--no-run", "--message-format=json"])
+    if build.returncode:
+        raise RuntimeError("cannot execute live binaries because their build failed")
+    executables = {}
+    for line in build.stdout.splitlines():
+        artifact = json.loads(line)
+        if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
+            executables[artifact["target"]["name"]] = artifact["executable"]
+
+    for target in ["live_one_replica", "live_three_replica", "three_replica_lifecycle"]:
+        executable = executables[target]
+        listed = subprocess.check_output(
+            [executable, "--ignored", "--list", "--format=terse"], cwd=ROOT, env=ENV, text=True
+        )
+        names = [line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")]
+        if target == "three_replica_lifecycle":
+            capability = execute("acl-capability", ["sudo", "-n", "setcap", "cap_chown+ep", executable])
+            if capability.returncode:
+                raise RuntimeError("cannot validate ACL deletion without the requested capability")
+        for index, name in enumerate(names):
+            fixture = FIXTURES / f"{target}-{index}"
+            environment = {
+                **ENV,
+                "SQLSERVER_ONE_REPLICA_ROOT": str(fixture),
+                "KUBERIC_MSSQL_THREE_REPLICA_ROOT": str(fixture),
+            }
+            execute(f"{target}-{name}", [executable, name, "--ignored", "--exact",
+                                        "--nocapture", "--test-threads=1"], environment)
+            if target != "three_replica_lifecycle":
+                family = "one" if target == "live_one_replica" else "three"
+                cleanup = execute(
+                    f"cleanup-{target}-{index}",
+                    [executables[f"mssql-{family}-replica-fixture"], "cleanup", "--root", str(fixture)],
+                )
+                if cleanup.returncode:
+                    raise RuntimeError("owned cleanup failed; refusing to launch further SQL fixtures")
+
+    execute("live-ag-convergence", [
+        executables["mssql-ag-convergence-fixture"],
+        str(FIXTURES / "ag-convergence"), executables["live_ag_convergence"],
+    ])
+    execute("cleanup-ag-convergence", [
+        executables["mssql-three-replica-fixture"], "cleanup", "--root",
+        str(FIXTURES / "ag-convergence"),
+    ])
+    REPORT["finished_at_unix"] = time.time()
+    save()
+    return 0 if all(result["success"] for result in REPORT["results"]) else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        REPORT["runner_error"] = str(error)
+        save()
+        print(f"full validation runner: {error}", file=sys.stderr)
+        sys.exit(1)

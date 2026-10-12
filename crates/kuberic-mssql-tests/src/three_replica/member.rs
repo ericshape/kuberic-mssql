@@ -110,6 +110,30 @@ impl LaunchedMembers {
             .await
     }
 
+    #[cfg(feature = "ag-convergence")]
+    pub async fn testing_prepare_operation_convergence_database(&self) -> Result<(), AdminError> {
+        let mut session = self.testing_admin_session(0).await?;
+        session
+            .execute(
+                "CREATE DATABASE [ag_convergence_data]; \
+                 ALTER DATABASE [ag_convergence_data] SET RECOVERY FULL;",
+                &[],
+            )
+            .await?;
+        session
+            .execute(
+                "CREATE TABLE [ag_convergence_data].dbo.port_marker \
+                 (id int NOT NULL PRIMARY KEY, marker nvarchar(64) NOT NULL); \
+                 INSERT [ag_convergence_data].dbo.port_marker VALUES (1, N'owned-ag-convergence'); \
+                 BACKUP DATABASE [ag_convergence_data] \
+                 TO DISK=N'/var/opt/mssql/data/ag_convergence_full.bak' WITH INIT, CHECKSUM; \
+                 BACKUP LOG [ag_convergence_data] \
+                 TO DISK=N'/var/opt/mssql/data/ag_convergence_log.bak' WITH INIT, CHECKSUM;",
+                &[],
+            )
+            .await
+    }
+
     pub async fn testing_create_unowned_availability_group(&self) -> Result<(), AdminError> {
         let group = availability_group_name(&self.run);
         validated_identifier(&group)?;

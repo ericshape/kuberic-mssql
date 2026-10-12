@@ -397,6 +397,33 @@ fn unsupported_native_capability_evidence_is_not_actionable() {
 }
 
 #[test]
+fn sql2025_enterprise_developer_display_aliases_match_the_observer_profile() {
+    for edition in [
+        "Enterprise Developer Edition (64-bit)",
+        "Developer Enterprise Edition (64-bit)",
+        "Enterprise Developer",
+        "Developer Enterprise",
+    ] {
+        let mut nodes = seed_nodes();
+        for node in &mut nodes {
+            snapshot(node).instance.edition = edition.to_owned();
+        }
+        assert!(matches!(
+            decide(seed_payload(), &nodes, &[]),
+            Decision::Execute(_)
+        ));
+    }
+    for edition in [
+        "Developer Standard Edition (64-bit)",
+        "Developer Edition (64-bit)",
+    ] {
+        let mut nodes = seed_nodes();
+        snapshot(&mut nodes[0]).instance.edition = edition.to_owned();
+        unsafe_decision(decide(seed_payload(), &nodes, &[]));
+    }
+}
+
+#[test]
 fn missing_failed_stale_and_future_evidence_never_establishes_completion() {
     let nodes = seed_nodes();
     wait(decide(seed_payload(), &nodes[..1], &[]));

@@ -36,6 +36,12 @@ name = "kuberic-release-intake"
 path = "src/bin/kuberic-release-intake.rs"
 test = false
 
+[[bin]]
+name = "mssql-ag-convergence-fixture"
+path = "src/bin/mssql-ag-convergence-fixture.rs"
+required-features = ["ag-convergence"]
+test = false
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true

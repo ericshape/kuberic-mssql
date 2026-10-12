@@ -523,6 +523,8 @@ fn check_evidence<'a>(
                 edition,
                 "Enterprise Developer"
                     | "Enterprise Developer Edition"
+                    | "Developer Enterprise"
+                    | "Developer Enterprise Edition"
                     | "Enterprise"
                     | "Enterprise Edition"
                     | "Enterprise Edition: Core-based Licensing"
