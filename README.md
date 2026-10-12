@@ -12,6 +12,16 @@ authentication and administrative credentials; the three standalone
 secondaries and perform one build-authorized automatic-seeding dispatch. This
 path is not exposed by the production CLI or runtime configuration.
 
+The default-disabled `ag-convergence` feature provides a separate
+[operation-envelope adapter](docs/convergence.md), migrated from
+[ericshape/kuberic#11](https://github.com/ericshape/kuberic/pull/11). It uses
+SQL Server 2025 observations, a version-2 codec and a private SQLite journal,
+and retains explicit authority, approval and fence verification boundaries.
+It does not replace the existing Kuberic bootstrap path or integrate its journal
+with Kuberic command/effect/build receipts. Enabling the feature does not enable
+mutations: the adapter defaults to observe-only with a denying verifier, and
+neither production binary exposes it.
+
 The library is compatible with the observation side of the currently pinned
 pre-alignment Kuberic contract. Its optional Kuberic runtime publishes
 validated AG configuration sequence through the current public `Replicator`
