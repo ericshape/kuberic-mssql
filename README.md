@@ -360,6 +360,8 @@ just check
 `just check` runs formatting, strict Clippy and locked all-feature Rust tests.
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
+The post-commit seed-store deadline test advances Tokio time only after its
+durable-completion gate; recovery uses the normal contract-test callback budget.
 
 Future Kuberic candidates have a separate server-free readiness group and a
 versioned intake-record validator:
