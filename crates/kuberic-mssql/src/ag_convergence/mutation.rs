@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::ag_convergence::config::MutationMode;
 use crate::ag_convergence::convergence::{
@@ -392,7 +392,38 @@ impl AgBackend for TdsAgBackend {
                 &self.database_name,
                 node.replication_endpoint.port(),
             )?;
-            session.execute_mutation(&sql).await
+            session.execute_mutation(&sql).await?;
+            if let NativeAction::JoinAvailabilityGroup {
+                availability_group,
+                target,
+            } = action
+            {
+                timeout(node.observer.connection().query_timeout, async {
+                    loop {
+                        let rows = observer
+                            .query_text(
+                                JOIN_POSTCONDITION_SQL,
+                                availability_group.name.as_str(),
+                                JOIN_POSTCONDITION_COLUMNS,
+                                "native JOIN verification",
+                            )
+                            .await?;
+                        if join_postcondition_ready(&rows, availability_group, target)? {
+                            return Ok(());
+                        }
+                        sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        ObservationFailureKind::TimedOut,
+                        "native JOIN verification",
+                        "exact native JOIN postcondition is still pending; intent is retained",
+                    )
+                })??;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| {
@@ -473,6 +504,117 @@ async fn connection_identity(
         ));
     }
     Ok((server, start, sid.to_ascii_lowercase()))
+}
+
+const JOIN_POSTCONDITION_COLUMNS: &[&str] = &[
+    "group_id",
+    "cluster_type",
+    "basic_features",
+    "is_distributed",
+    "required_secondaries",
+    "replica_id",
+    "role",
+];
+
+const JOIN_POSTCONDITION_SQL: &str = r#"SELECT
+    CONVERT(nvarchar(36), g.group_id) AS group_id,
+    CONVERT(nvarchar(10), g.cluster_type) AS cluster_type,
+    CONVERT(nvarchar(10), g.basic_features) AS basic_features,
+    CONVERT(nvarchar(10), g.is_distributed) AS is_distributed,
+    CONVERT(nvarchar(10), g.required_synchronized_secondaries_to_commit) AS required_secondaries,
+    CONVERT(nvarchar(36), r.replica_id) AS replica_id,
+    CONVERT(nvarchar(60), r.role_desc) AS role
+FROM sys.availability_groups AS g
+LEFT JOIN sys.dm_hadr_availability_replica_states AS r
+    ON r.group_id = g.group_id AND r.is_local = 1
+WHERE g.name = @P1;"#;
+
+fn join_postcondition_ready(
+    rows: &[QueryRow],
+    group: &AvailabilityGroupIdentity,
+    target: &ReplicaIdentity,
+) -> Result<bool, RuntimeError> {
+    let row = match rows {
+        [] => return Ok(false),
+        [row] => row,
+        _ => {
+            return Err(failure(
+                ObservationFailureKind::Malformed,
+                "native JOIN returned ambiguous local group metadata",
+            ));
+        }
+    };
+    let value = |column: &str| {
+        row.get(column).ok_or_else(|| {
+            failure(
+                ObservationFailureKind::Malformed,
+                "native JOIN metadata is incomplete",
+            )
+        })
+    };
+    let required = |column: &str| {
+        value(column)?.as_deref().ok_or_else(|| {
+            failure(
+                ObservationFailureKind::Malformed,
+                "native JOIN group metadata is NULL",
+            )
+        })
+    };
+    let actual_group = Guid::parse("group_id", required("group_id")?).map_err(|_| {
+        failure(
+            ObservationFailureKind::Malformed,
+            "native JOIN group GUID is invalid",
+        )
+    })?;
+    if actual_group != group.group_id {
+        return Err(failure(
+            ObservationFailureKind::Inconsistent,
+            "native JOIN discovered a different availability-group GUID",
+        ));
+    }
+    if required("cluster_type")? != "2"
+        || required("basic_features")? != "0"
+        || required("is_distributed")? != "0"
+        || required("required_secondaries")? != SUPPORTED_REQUIRED_SECONDARIES.to_string()
+    {
+        return Err(failure(
+            ObservationFailureKind::Unsupported,
+            "native JOIN discovered an unsupported availability-group profile",
+        ));
+    }
+    let Some(replica) = value("replica_id")?.as_deref() else {
+        if value("role")?.is_some() {
+            return Err(failure(
+                ObservationFailureKind::Malformed,
+                "native JOIN role has no local replica GUID",
+            ));
+        }
+        return Ok(false);
+    };
+    let actual_replica = Guid::parse("replica_id", replica).map_err(|_| {
+        failure(
+            ObservationFailureKind::Malformed,
+            "native JOIN local replica GUID is invalid",
+        )
+    })?;
+    if &actual_replica != require_native(target)? {
+        return Err(failure(
+            ObservationFailureKind::Inconsistent,
+            "native JOIN discovered a different local replica GUID",
+        ));
+    }
+    match value("role")?.as_deref() {
+        Some("SECONDARY") => Ok(true),
+        None | Some("RESOLVING") => Ok(false),
+        Some("PRIMARY") => Err(failure(
+            ObservationFailureKind::Inconsistent,
+            "native JOIN target is a primary",
+        )),
+        _ => Err(failure(
+            ObservationFailureKind::Malformed,
+            "native JOIN local replica role is invalid",
+        )),
+    }
 }
 
 fn request_names(envelope: &OperationEnvelope) -> (&AvailabilityGroupName, Option<&SqlIdentifier>) {
@@ -1037,12 +1179,11 @@ fn render_action(
             body.push_str(&format!(
                 "IF EXISTS (SELECT 1 FROM sys.availability_groups WHERE name = {} AND group_id <> {group_id}) THROW 51000, 'A different native group already exists', 1;\n\
                  IF EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE group_id = {group_id} AND is_local = 1 AND role_desc = N'PRIMARY') THROW 51000, 'Cannot join over a primary', 1;\n\
-                 IF NOT EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE group_id = {group_id} AND replica_id = {replica_id} AND is_local = 1 AND role_desc = N'SECONDARY')\n\
+                 IF EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE group_id = {group_id} AND is_local = 1 AND replica_id <> {replica_id}) THROW 51000, 'Local native replica identity changed', 1;\n\
+                 IF NOT EXISTS (SELECT 1 FROM sys.availability_groups WHERE name = {} AND group_id = {group_id})\n\
                  BEGIN ALTER AVAILABILITY GROUP {} JOIN WITH (CLUSTER_TYPE = EXTERNAL); END;\n",
-                literal(group.name.as_str()), group.name.quoted()
+                literal(group.name.as_str()), literal(group.name.as_str()), group.name.quoted()
             ));
-            body.push_str(&group_guard(group));
-            body.push_str(&role_guard(group, target, "SECONDARY")?);
         }
         NativeAction::GrantSeeding {
             availability_group: group,
@@ -1562,10 +1703,123 @@ mod tests {
         .unwrap();
         assert_eq!(sql.matches(" JOIN WITH ").count(), 1);
         assert!(sql.contains("Cannot join over a primary"));
-        let join = sql.find("JOIN WITH").unwrap();
-        assert!(sql[join..].contains("Availability-group identity or profile changed"));
-        assert!(sql[join..].contains("Local native role or replica identity changed"));
+        assert!(sql.contains("A different native group already exists"));
+        assert!(sql.contains("Local native replica identity changed"));
+        assert!(sql.contains(
+            "IF NOT EXISTS (SELECT 1 FROM sys.availability_groups WHERE name = N'group'"
+        ));
+        assert!(!sql.contains("role_desc = N'SECONDARY'"));
         assert!(!sql.contains("GRANT CREATE ANY DATABASE"));
+    }
+
+    fn joined_row() -> QueryRow {
+        [
+            ("group_id", Some(group().group_id.to_string())),
+            ("cluster_type", Some("2".to_owned())),
+            ("basic_features", Some("0".to_owned())),
+            ("is_distributed", Some("0".to_owned())),
+            (
+                "required_secondaries",
+                Some(SUPPORTED_REQUIRED_SECONDARIES.to_string()),
+            ),
+            (
+                "replica_id",
+                Some(require_native(&replica(1)).unwrap().to_string()),
+            ),
+            ("role", Some("SECONDARY".to_owned())),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+    }
+
+    #[test]
+    fn join_verification_waits_for_local_discovery_and_secondary_role() {
+        assert!(!join_postcondition_ready(&[], &group(), &replica(1)).unwrap());
+        let mut row = joined_row();
+        row.insert("replica_id".to_owned(), None);
+        row.insert("role".to_owned(), None);
+        assert!(!join_postcondition_ready(&[row], &group(), &replica(1)).unwrap());
+        let mut row = joined_row();
+        row.insert("role".to_owned(), Some("RESOLVING".to_owned()));
+        assert!(!join_postcondition_ready(&[row], &group(), &replica(1)).unwrap());
+        assert!(join_postcondition_ready(&[joined_row()], &group(), &replica(1)).unwrap());
+    }
+
+    #[test]
+    fn join_verification_rejects_foreign_guid_profile_and_primary() {
+        for (column, value, kind) in [
+            (
+                "group_id",
+                guid(999).to_string(),
+                ObservationFailureKind::Inconsistent,
+            ),
+            (
+                "replica_id",
+                guid(999).to_string(),
+                ObservationFailureKind::Inconsistent,
+            ),
+            (
+                "cluster_type",
+                "0".to_owned(),
+                ObservationFailureKind::Unsupported,
+            ),
+            (
+                "basic_features",
+                "1".to_owned(),
+                ObservationFailureKind::Unsupported,
+            ),
+            (
+                "is_distributed",
+                "1".to_owned(),
+                ObservationFailureKind::Unsupported,
+            ),
+            (
+                "required_secondaries",
+                "0".to_owned(),
+                ObservationFailureKind::Unsupported,
+            ),
+            (
+                "role",
+                "PRIMARY".to_owned(),
+                ObservationFailureKind::Inconsistent,
+            ),
+            (
+                "role",
+                "UNKNOWN".to_owned(),
+                ObservationFailureKind::Malformed,
+            ),
+        ] {
+            let mut row = joined_row();
+            row.insert(column.to_owned(), Some(value));
+            assert_eq!(
+                join_postcondition_ready(&[row], &group(), &replica(1))
+                    .unwrap_err()
+                    .kind,
+                kind,
+                "invalid {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_verification_rejects_ambiguous_and_malformed_metadata() {
+        assert_eq!(
+            join_postcondition_ready(&[joined_row(), joined_row()], &group(), &replica(1))
+                .unwrap_err()
+                .kind,
+            ObservationFailureKind::Malformed
+        );
+        for column in JOIN_POSTCONDITION_COLUMNS {
+            let mut row = joined_row();
+            row.remove(*column);
+            assert_eq!(
+                join_postcondition_ready(&[row], &group(), &replica(1))
+                    .unwrap_err()
+                    .kind,
+                ObservationFailureKind::Malformed
+            );
+        }
     }
 
     #[test]

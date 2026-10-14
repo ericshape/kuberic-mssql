@@ -184,6 +184,14 @@ target metadata has not yet been discovered, authenticated source authority
 and registered peer bindings are required. The executor checks the resulting
 group and local replica GUIDs after JOIN, before acknowledgement. An unexpected
 result does not enable seeding and is not treated as success.
+Native JOIN can return before the local catalog and secondary role are visible.
+The executor polls that postcondition on the already authenticated observation
+connection within the configured query and whole-sample deadlines. Missing local
+metadata or `RESOLVING` is pending, not an unsupported native mutation. A different
+GUID, unsupported profile, primary role or malformed result is rejected
+immediately. Timeout retains the unacknowledged intent; subsequent reconciliation
+reobserves before issuing another command. A matching local group is not joined
+again merely because its role is still settling.
 
 ### Automatic seeding
 
@@ -297,9 +305,11 @@ attempts, including `Request Denied`, remain refusals: this change does not
 erase history, reset a journal, or implicitly authorize a retry or reseed.
 
 The observer also correctly rejects an observation spanning a native
-configuration or role transition. A native physical-seeding row with a not-yet
-initialized (nil) identifier is rejected as malformed. The current opt-in driver
-aborts on these diagnostics rather than retrying them.
+configuration or role transition. The opt-in driver logs and discards these
+`inconsistent` attempts, then reobserves within its existing five-minute budget.
+No failed sample is reused as evidence. A native physical-seeding row with a
+not-yet initialized (nil) identifier remains a fatal malformed diagnostic;
+mutation failures and other observation errors are not automatically retried.
 
 The H1 pilot completed both native copies and retained seed-result replay.
 The final combined run passed all five live tests, after earlier invocations

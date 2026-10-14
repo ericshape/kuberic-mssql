@@ -505,6 +505,9 @@ records intent before each resource create and binds exact container, network,
 path, native SQL, and process-incarnation evidence. Normal completion, setup
 failure, panic, SIGINT, and SIGTERM attempt bounded cleanup; an uncatchable
 termination is recovered from that journal on the next command.
+Container inspection failures identify the changed field without exposing
+environment values or credentials. Frozen running state, loopback ports and
+immutable ownership are checked again before member initialization.
 
 Use the actual recovery recipes rather than deleting Docker resources or the
 journal manually:
@@ -526,6 +529,9 @@ otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
 executes real SIGINT and SIGKILL subprocess cases.
+The post-AG/report fault-checkpoint test also injects an explicit failure after
+replacement-host startup on the current bootstrap-restart path, then proves
+separate-process cleanup and a successful same-root retry.
 
 The fault recipe uses a test-only observation seam to lose the callback reply
 after each separately classified database, backup, AG-create/bind, local-join,
@@ -534,6 +540,11 @@ normal TDS mutation path, and replacement hosts then reobserve their native
 results. Seed intent, submission, acceptance, association, native completion,
 and callback publication use explicit test-only gates/probes around real
 callbacks; they are not SQL Server process-crash tests.
+Public configuration, build-authority admission and callback retries also
+reobserve a rejected `Inconsistent` sample within their existing operation
+deadline. This is confined
+to the licensed test harness; native identity conflicts and permanent refusals
+are not converted to successful admission.
 
 The conflict recipe separates three real SQL-native cases from callback-seam
 coverage. Through normal TDS observation it converges a source that inherits

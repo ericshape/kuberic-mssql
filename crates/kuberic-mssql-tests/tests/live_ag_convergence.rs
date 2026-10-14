@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kuberic_mssql::ag_convergence::adapter::{AdapterOutcome, AgAdapter};
+use kuberic_mssql::ag_convergence::adapter::{AdapterError, AdapterOutcome, AgAdapter};
 use kuberic_mssql::ag_convergence::convergence::{AcceptedAuthority, NativeAction, Postcondition};
 use kuberic_mssql::ag_convergence::journal::OperationJournal;
 use kuberic_mssql::ag_convergence::mutation::{
@@ -124,11 +124,18 @@ async fn drive(
 ) -> Postcondition {
     tokio::time::timeout(Duration::from_secs(300), async {
         loop {
-            match adapter
-                .reconcile(request, authority)
-                .await
-                .expect("authorized lab reconciliation failed; intent is retained")
-            {
+            let outcome = match adapter.reconcile(request, authority).await {
+                Ok(outcome) => outcome,
+                Err(error) if changing_lab_observation(&error) => {
+                    eprintln!("lab discarded a changing native observation: {error}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error) => {
+                    panic!("authorized lab reconciliation failed; intent is retained: {error}");
+                }
+            };
+            match outcome {
                 AdapterOutcome::Complete { postcondition, .. } => return postcondition,
                 AdapterOutcome::Prepared(_)
                 | AdapterOutcome::Dispatched(_)
@@ -141,6 +148,52 @@ async fn drive(
     })
     .await
     .expect("native postcondition was not established within five minutes")
+}
+
+fn changing_lab_observation(error: &AdapterError) -> bool {
+    matches!(
+        error,
+        AdapterError::Observation { failure, .. }
+            if failure.kind == ObservationFailureKind::Inconsistent
+    )
+}
+
+#[test]
+fn lab_reobserves_only_failed_changing_observations() {
+    let replica = ReplicaIdentity::observed(
+        "replica-test",
+        kuberic_mssql::Guid::parse("replica", "00000000-0000-0000-0000-000000000001").unwrap(),
+        "incarnation-test",
+    )
+    .unwrap();
+    for kind in [
+        ObservationFailureKind::Inconsistent,
+        ObservationFailureKind::Malformed,
+        ObservationFailureKind::Unsupported,
+        ObservationFailureKind::Unreachable,
+        ObservationFailureKind::TimedOut,
+        ObservationFailureKind::PermissionDenied,
+    ] {
+        let error = AdapterError::Observation {
+            replica: replica.clone(),
+            failure: kuberic_mssql::ObservationFailure {
+                kind,
+                message: "sanitized observation failure".to_owned(),
+                observed_at_unix_millis: 1,
+            },
+        };
+        assert_eq!(
+            changing_lab_observation(&error),
+            kind == ObservationFailureKind::Inconsistent
+        );
+    }
+    assert!(!changing_lab_observation(&AdapterError::Runtime(
+        RuntimeError::new(
+            ObservationFailureKind::Inconsistent,
+            "native mutation",
+            "identity mismatch",
+        )
+    )));
 }
 
 async fn primary_group(
